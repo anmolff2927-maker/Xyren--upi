@@ -426,4 +426,180 @@ def telegram_webhook():
                             
                         if bet_inr is None or bet_inr <= 0:
                             send_message(chat_id, "⚠️ Enter a valid bet amount.")
-                        elif bet_inr < MIN_B
+                        elif bet_inr < MIN_BET or bet_inr > MAX_BET:
+                            send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                        elif user_balances[user_id] < bet_inr:
+                            send_message(chat_id, "❌ Insufficient balance! Use `/deposit <amount>` to add money.")
+                        else:
+                            user_balances[user_id] -= bet_inr
+                            active_games[user_id] = {"bet": bet_inr, "emoji": triggered_game, "step": "selecting_turn"}
+                            
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [
+                                        {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
+                                        {"text": "👤 You Roll First", "callback_data": "play_user_first"}
+                                    ]
+                                ]
+                            }
+                            send_message(chat_id, f"🎮 *Game Started* ({triggered_game} | Bet: {format_money(bet_inr, user_id)})\n\nChoose who rolls first:", reply_markup=keyboard)
+                            
+                    elif text in ['/panel', '/admin']:
+                        if user_id == ADMIN_USER_ID:
+                            panel_text = (
+                                "👑 *Owner Admin Control Panel*\n\n"
+                                "Commands:\n"
+                                "- `/hb` - Check House Balance\n"
+                                "- `/sethb <amount>` - Set House Balance\n"
+                                "- `/deducthb <amount>` - Deduct HB\n"
+                                "- `/minbet <amount>` - Set Min Bet\n"
+                                "- `/maxbet <amount>` - Set Max Bet\n"
+                                "- `/setrate <rate>` - Set USD/INR Rate\n"
+                                "- `/addbalance <user_id> <amount>`\n"
+                                "- `/users` - View all users\n"
+                                "- `/sendto <user_id> <message>`"
+                            )
+                            send_message(chat_id, panel_text)
+                        else:
+                            send_message(chat_id, "⛔ Unauthorized.")
+                            
+                    elif text.startswith('/addbalance '):
+                        if user_id == ADMIN_USER_ID:
+                            parts = text.split(' ')
+                            if len(parts) == 3 and parts[1].isdigit():
+                                t_user = int(parts[1])
+                                amt = parse_user_amount(parts[2], user_id)
+                                if t_user not in user_balances: user_balances[t_user] = 0.0
+                                user_balances[t_user] += amt
+                                send_message(chat_id, f"✅ Updated User `{t_user}`. New Bal: {format_money(user_balances[t_user], t_user)}")
+                                send_message(t_user, f"💰 *Admin updated your balance!* New Balance: {format_money(user_balances[t_user], t_user)}")
+                            else:
+                                send_message(chat_id, "⚠️ Format: `/addbalance <user_id> <amount>`")
+                                
+                    elif text == '/users':
+                        if user_id == ADMIN_USER_ID:
+                            txt = "👥 *Users & Balances:*\n"
+                            for uid, bal in user_balances.items(): 
+                                txt += f"- `{uid}`: {format_money(bal, uid)}\n"
+                            send_message(chat_id, txt)
+                            
+                    elif text.startswith('/sendto '):
+                        if user_id == ADMIN_USER_ID:
+                            parts = text.split(' ', 2)
+                            if len(parts) >= 3 and parts[1].isdigit():
+                                send_message(int(parts[1]), f"📢 *Admin Message:*\n\n{parts[2]}")
+                                send_message(chat_id, "✅ Message sent successfully!")
+
+        elif 'callback_query' in data:
+            query = data['callback_query']
+            callback_data = query['data']
+            chat_id = query['message']['chat']['id']
+            user_id = query['from']['id']
+            
+            if user_id not in user_balances:
+                user_balances[user_id] = 100.0
+                user_currency[user_id] = 'INR'
+                
+            if callback_data == "curr_inr":
+                user_currency[user_id] = 'INR'
+                send_message(chat_id, "✅ Currency successfully set to *INR (₹)*!")
+            elif callback_data == "curr_usdt":
+                user_currency[user_id] = 'USDT'
+                send_message(chat_id, "✅ Currency successfully set to *USDT ($)*!")
+                
+            elif callback_data in ["play_user_first", "play_bot_first"]:
+                if user_id not in active_games:
+                    send_message(chat_id, "⚠️ Session expired. Start a new game.")
+                    return jsonify({'status': 'ok'}), 200
+                    
+                game = active_games[user_id]
+                emoji = game["emoji"]
+                
+                if callback_data == "play_user_first":
+                    game["step"] = "waiting_user_first"
+                    send_message(chat_id, f"👤 You chose to roll first!\n\n👉 *Please send the `{emoji}` emoji in chat now to make your throw!*")
+                else:
+                    game["step"] = "waiting_user_second"
+                    send_message(chat_id, f"🤖 Bot is throwing {emoji} first...")
+                    
+                    res_b = send_animated_game(chat_id, emoji)
+                    bot_val = res_b['result']['dice']['value'] if res_b and 'result' in res_b else random.randint(1, 6)
+                    game["bot_val"] = bot_val
+                    
+                    time.sleep(1)
+                    send_message(chat_id, f"🤖 Bot Roll: *{bot_val}*\n\n👉 *Now your turn! Please send the `{emoji}` emoji in chat to throw.*")
+                
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        print(f"❌ Webhook Error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 200
+
+def finish_game(chat_id, user_id, user_val, bot_val, bet, emoji):
+    global HOUSE_BALANCE
+    res_text = f"📊 *Game Results ({emoji})*\n\n👤 You: *{user_val}*\n🤖 Bot: *{bot_val}*\n\n"
+    
+    if user_val > bot_val:
+        win = bet * 1.94
+        profit_inr = win - bet
+        user_balances[user_id] += win
+        HOUSE_BALANCE -= profit_inr
+        update_user_stats(user_id, emoji, bet, profit_inr, True)
+        res_text += f"🎉 *You WON {format_money(win, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+    elif user_val < bot_val:
+        profit_inr = -bet
+        HOUSE_BALANCE += bet
+        update_user_stats(user_id, emoji, bet, profit_inr, False)
+        res_text += f"😢 *You Lost!* Bot wins.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+    else:
+        user_balances[user_id] += bet
+        update_user_stats(user_id, emoji, bet, 0.0, False)
+        res_text += f"🤝 *It's a Tie!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+        
+    send_message(chat_id, res_text)
+    if user_id in active_games:
+        del active_games[user_id]
+
+@app.route('/zapupi-webhook', methods=['POST'])
+def zapupi_webhook():
+    try:
+        data = request.get_json()
+        if not data: 
+            return jsonify({'status': 'error', 'message': 'No data'}), 400
+        
+        order_id = data.get('order_id')
+        status = data.get('status')
+        amount = float(data.get('amount', 0))
+        utr = data.get('utr', '')
+        
+        if status and status.lower() == 'success':
+            remark = data.get('remark', '')
+            chat_id = None
+            
+            if '|' in remark:
+                parts = remark.split('|')
+                for p in parts:
+                    if p.isdigit():
+                        chat_id = int(p)
+                        break
+            elif remark.isdigit():
+                chat_id = int(remark)
+                
+            if chat_id:
+                if chat_id not in user_balances: 
+                    user_balances[chat_id] = 0.0
+                    user_currency[chat_id] = 'INR'
+                user_balances[user_id] += amount
+                
+                if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
+                user_deposits[chat_id] += amount
+                
+                success_msg = f"✅ *Deposit Successful!* 🎉\n\nAdded: {format_money(amount, chat_id)}\nNew Balance: {format_money(user_balances[chat_id], chat_id)}\nOrder ID: `{order_id}`\nUTR: `{utr}`"
+                send_message(chat_id, success_msg)
+                    
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        print(f"❌ ZapUPI Webhook Error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
