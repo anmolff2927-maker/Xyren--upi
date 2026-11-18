@@ -2,6 +2,7 @@ import os
 import time
 import random
 import io
+import re
 import requests
 from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
@@ -40,6 +41,18 @@ EXCHANGE_RATE = 98.0
 MAINTENANCE_MODE = False
 DEPOSIT_ENABLED = True
 WITHDRAW_ENABLED = True
+
+VALID_RW_MODES = {
+    "1r1w": (1, 1),
+    "2r1w": (2, 1),
+    "3r1w": (3, 1),
+    "1r2w": (1, 2),
+    "2r2w": (2, 2),
+    "3r2w": (3, 2),
+    "1r3w": (1, 3),
+    "2r3w": (2, 3),
+    "3r3w": (3, 3),
+}
 
 def format_money(amount_in_inr, user_id):
     curr = user_currency.get(user_id, 'INR')
@@ -170,6 +183,16 @@ def send_animated_game(chat_id, emoji):
         print(f"Error sending game: {e}")
         return None
 
+def roll_bot_series(chat_id, emoji, rolls_count):
+    vals = []
+    for _ in range(rolls_count):
+        res = send_animated_game(chat_id, emoji)
+        v = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
+        vals.append(v)
+        if rolls_count > 1:
+            time.sleep(0.6)
+    return vals
+
 def create_zapupi_order(amount, chat_id):
     url = "https://pay.zapupi.com/api/create-order"
     order_id = "ORD" + str(int(time.time() * 1000))
@@ -193,6 +216,95 @@ def create_zapupi_order(amount, chat_id):
     except Exception as e:
         return "⚠️ Failed to connect to payment gateway."
 
+def resolve_round_and_match(chat_id, user_id, game):
+    global HOUSE_BALANCE
+    emoji = game["emoji"]
+    mode = game["mode"]
+    rw_label = game["rw_label"]
+    target_wins = game["target_wins"]
+    bet = game["bet"]
+    
+    u_vals = game["current_user_rolls"]
+    b_vals = game["current_bot_rolls"]
+    u_sum = sum(u_vals)
+    b_sum = sum(b_vals)
+    
+    u_expr = "+".join(map(str, u_vals))
+    b_expr = "+".join(map(str, b_vals))
+    
+    round_num = game["round_num"]
+    mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
+    
+    if u_sum == b_sum:
+        round_winner = "tie"
+        r_status = "🤝 *Round Tied!* No point awarded."
+    elif mode == "crazy":
+        if u_sum < b_sum:
+            round_winner = "user"
+            game["user_wins"] += 1
+            r_status = "🎉 *You win this round!* (Lower sum wins)"
+        else:
+            round_winner = "bot"
+            game["bot_wins"] += 1
+            r_status = "🤖 *Bot wins this round!* (Lower sum wins)"
+    else:
+        if u_sum > b_sum:
+            round_winner = "user"
+            game["user_wins"] += 1
+            r_status = "🎉 *You win this round!* (Higher sum wins)"
+        else:
+            round_winner = "bot"
+            game["bot_wins"] += 1
+            r_status = "🤖 *Bot wins this round!* (Higher sum wins)"
+            
+    msg = (
+        f"⚔️ *Round {round_num}* (`{rw_label}` | {mode_tag})\n"
+        f"👤 You: `{u_expr}` = *{u_sum}*\n"
+        f"🤖 Bot: `{b_expr}` = *{b_sum}*\n"
+        f"{r_status}\n"
+        f"🏆 Score — You: *{game['user_wins']}* | Bot: *{game['bot_wins']}* (First to *{target_wins}*)"
+    )
+    send_message(chat_id, msg)
+    
+    # Check match winner
+    if game["user_wins"] >= target_wins or game["bot_wins"] >= target_wins:
+        user_won_match = game["user_wins"] >= target_wins
+        final_text = f"🏁 *Match Over ({emoji} | {rw_label})*\n\n"
+        if user_won_match:
+            win_amt = bet * 1.94
+            profit_inr = win_amt - bet
+            user_balances[user_id] += win_amt
+            HOUSE_BALANCE -= profit_inr
+            update_user_stats(user_id, emoji, bet, profit_inr, True)
+            final_text += f"👑 *BOOYAH! You WON the Match!* 🎉\nPayout: *{format_money(win_amt, user_id)}* (`1.94x`)\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+        else:
+            profit_inr = -bet
+            HOUSE_BALANCE += bet
+            update_user_stats(user_id, emoji, bet, profit_inr, False)
+            final_text += f"😢 *Bot WON the Match!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+            
+        send_message(chat_id, final_text)
+        if user_id in active_games:
+            del active_games[user_id]
+        return
+
+    # Prepare next round
+    game["round_num"] += 1
+    game["current_user_rolls"] = []
+    game["current_bot_rolls"] = []
+    rolls_per_round = game["rolls_per_round"]
+    
+    if game["first_turn"] == "bot":
+        game["step"] = "waiting_user_second"
+        send_message(chat_id, f"🤖 *Round {game['round_num']}* — Bot is throwing `{emoji}` x{rolls_per_round}...")
+        b_next = roll_bot_series(chat_id, emoji, rolls_per_round)
+        game["current_bot_rolls"] = b_next
+        b_next_expr = "+".join(map(str, b_next))
+        send_message(chat_id, f"🤖 Bot Roll: `{b_next_expr}` (*{sum(b_next)}*)\n\n👉 *Now your turn! Send `{emoji}` x{rolls_per_round} in chat.*")
+    else:
+        game["step"] = "waiting_user_first"
+        send_message(chat_id, f"👤 *Round {game['round_num']}* — Your turn! Send `{emoji}` x{rolls_per_round} in chat.")
+
 @app.route('/')
 def index():
     return f"{BOT_USERNAME} Casino Bot is Live!", 200
@@ -208,7 +320,7 @@ def telegram_webhook():
         if 'message' in data:
             message = data['message']
             chat_id = message['chat'].get('id')
-            chat_type = message['chat'].get('type') # 'private', 'group', 'supergroup'
+            chat_type = message['chat'].get('type')
             user_id = message['from'].get('id')
             
             if chat_type in ['group', 'supergroup'] and chat_id not in approved_groups and user_id not in admin_list:
@@ -420,31 +532,36 @@ def telegram_webhook():
                 del withdrawal_states[user_id]
                 return jsonify({'status': 'ok'}), 200
 
+            # --- EMOJI GAME ROLLS (RW MULTI-ROLL SUPPORT) ---
             if 'dice' in message and user_id in active_games:
                 game = active_games[user_id]
                 expected_emoji = game['emoji']
                 user_dice = message['dice']
                 
-                if user_dice.get('emoji') == expected_emoji:
+                if user_dice.get('emoji') == expected_emoji and game['step'] in ['waiting_user_first', 'waiting_user_second']:
                     user_val = user_dice.get('value', 1)
-                    bet = game['bet']
-                    step = game['step']
-                    mode = game['mode']
+                    rolls_needed = game['rolls_per_round']
+                    game['current_user_rolls'].append(user_val)
                     
+                    remaining = rolls_needed - len(game['current_user_rolls'])
+                    if remaining > 0:
+                        send_message(chat_id, f"🎲 Roll `{len(game['current_user_rolls'])}/{rolls_needed}`: *{user_val}* — Send `{remaining}` more `{expected_emoji}`!")
+                        return jsonify({'status': 'ok'}), 200
+                        
+                    step = game['step']
                     if step == 'waiting_user_first':
-                        game['user_val'] = user_val
-                        send_message(chat_id, f"👤 Your Roll ({expected_emoji}): *{user_val}*\n\n🤖 Now bot is throwing...")
-                        time.sleep(1)
+                        u_expr = "+".join(map(str, game['current_user_rolls']))
+                        send_message(chat_id, f"👤 Your Rolls ({expected_emoji}): `{u_expr}` (*{sum(game['current_user_rolls'])}*)\n\n🤖 Now bot is throwing...")
+                        time.sleep(0.8)
                         
-                        res_b = send_animated_game(chat_id, expected_emoji)
-                        bot_val = res_b['result']['dice']['value'] if res_b and 'result' in res_b else random.randint(1, 6)
+                        b_vals = roll_bot_series(chat_id, expected_emoji, rolls_needed)
+                        game['current_bot_rolls'] = b_vals
                         
-                        finish_game(chat_id, user_id, user_val, bot_val, bet, expected_emoji, mode)
+                        resolve_round_and_match(chat_id, user_id, game)
                         return jsonify({'status': 'ok'}), 200
                         
                     elif step == 'waiting_user_second':
-                        bot_val = game['bot_val']
-                        finish_game(chat_id, user_id, user_val, bot_val, bet, expected_emoji, mode)
+                        resolve_round_and_match(chat_id, user_id, game)
                         return jsonify({'status': 'ok'}), 200
 
             if 'text' in message:
@@ -473,7 +590,9 @@ def telegram_webhook():
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
-                        "_🔥 Add `crazy` for Lowest Win mode! (e.g. `/dice 50 crazy`)_\n\n"
+                        "• Modes: `1r1w`, `2r1w`, `3r1w`, `1r2w`, `2r2w`, `3r2w`, `1r3w`, `2r3w`, `3r3w`\n"
+                        "• Add `crazy` for Lowest Sum Wins!\n"
+                        "• Example: `/dice 50 2r2w` or `/dart 50 3r2w crazy`\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
@@ -485,7 +604,6 @@ def telegram_webhook():
                     
                     bal_str = format_money(user_balances[user_id], user_id)
                     
-                    # 🚀 Yahan check kiya: Agar group mein hai toh Deposit/Withdraw ke buttons nahi dikhenge!
                     if chat_type == 'private':
                         bal_keyboard = {
                             "inline_keyboard": [
@@ -497,7 +615,6 @@ def telegram_webhook():
                         }
                         send_message(chat_id, f"💰 *Your Wallet Balance:* {bal_str}", reply_markup=bal_keyboard)
                     else:
-                        # Group mein sirf balance dikhega, aur DM ka button hoga
                         bal_keyboard = {
                             "inline_keyboard": [
                                 [
@@ -671,36 +788,59 @@ def telegram_webhook():
                     
                     triggered_game = None
                     for cmd, emoji in game_cmd_map.items():
-                        if text.startswith(cmd):
+                        if re.match(rf"^{re.escape(cmd)}(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                             triggered_game = emoji
                             break
                     
                     if triggered_game:
-                        parts = text.split(' ')
+                        tokens = text.split()[1:]
                         bet_inr = parse_user_amount("10", user_id)
                         mode = "normal"
+                        rw_label = "1r1w"
+                        invalid_rw = False
                         
-                        if len(parts) > 1:
-                            if parts[1].lower() == 'crazy':
+                        for tok in tokens:
+                            low_tok = tok.lower()
+                            if low_tok == "crazy":
                                 mode = "crazy"
-                                if len(parts) > 2:
-                                    bet_inr = parse_user_amount(parts[2], user_id)
+                            elif re.fullmatch(r"\d+r\d+w", low_tok):
+                                if low_tok in VALID_RW_MODES:
+                                    rw_label = low_tok
+                                else:
+                                    invalid_rw = True
                             else:
-                                bet_inr = parse_user_amount(parts[1], user_id)
-                                if len(parts) > 2 and parts[2].lower() == 'crazy':
-                                    mode = "crazy"
+                                parsed = parse_user_amount(tok, user_id)
+                                if parsed is not None:
+                                    bet_inr = parsed
                                     
-                        if bet_inr is None or bet_inr <= 0:
+                        if invalid_rw:
+                            send_message(chat_id, "⚠️ Invalid RW mode! Allowed modes: `1r1w`, `2r1w`, `3r1w`, `1r2w`, `2r2w`, `3r2w`, `1r3w`, `2r3w`, `3r3w`.")
+                        elif bet_inr is None or bet_inr <= 0:
                             send_message(chat_id, "⚠️ Enter a valid bet amount.")
                         elif bet_inr < MIN_BET or bet_inr > MAX_BET:
                             send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                         elif user_balances[user_id] < bet_inr:
                             send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
                         else:
+                            rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
                             user_balances[user_id] -= bet_inr
-                            active_games[user_id] = {"bet": bet_inr, "emoji": triggered_game, "mode": mode, "step": "selecting_turn"}
+                            active_games[user_id] = {
+                                "bet": bet_inr,
+                                "emoji": triggered_game,
+                                "mode": mode,
+                                "rw_label": rw_label,
+                                "rolls_per_round": rolls_per_round,
+                                "target_wins": target_wins,
+                                "round_num": 1,
+                                "user_wins": 0,
+                                "bot_wins": 0,
+                                "current_user_rolls": [],
+                                "current_bot_rolls": [],
+                                "first_turn": None,
+                                "step": "selecting_turn"
+                            }
                             
-                            mode_title = "🔥 CRAZY MODE (Lowest Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Wins)"
+                            mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
                             keyboard = {
                                 "inline_keyboard": [
                                     [
@@ -709,7 +849,13 @@ def telegram_webhook():
                                     ]
                                 ]
                             }
-                            send_message(chat_id, f"🎮 *Game Started* ({triggered_game} | {mode_title})\n💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:", reply_markup=keyboard)
+                            send_message(
+                                chat_id,
+                                f"🎮 *Game Started* ({triggered_game} | `{rw_label}` | {mode_title})\n"
+                                f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
+                                f"💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:",
+                                reply_markup=keyboard
+                            )
 
         elif 'callback_query' in data:
             query = data['callback_query']
@@ -895,63 +1041,29 @@ def telegram_webhook():
                     
                 game = active_games[user_id]
                 emoji = game["emoji"]
+                rolls_needed = game["rolls_per_round"]
+                game["current_user_rolls"] = []
+                game["current_bot_rolls"] = []
                 
                 if callback_data == "play_user_first":
+                    game["first_turn"] = "user"
                     game["step"] = "waiting_user_first"
-                    send_message(chat_id, f"👤 You chose to roll first!\n\n👉 *Please send the `{emoji}` emoji in chat now to make your throw!*")
+                    send_message(chat_id, f"👤 You chose to roll first!\n\n👉 *Please send `{emoji}` x{rolls_needed} in chat now for Round {game['round_num']}!*")
                 else:
+                    game["first_turn"] = "bot"
                     game["step"] = "waiting_user_second"
-                    send_message(chat_id, f"🤖 Bot is throwing {emoji} first...")
+                    send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first...")
                     
-                    res_b = send_animated_game(chat_id, emoji)
-                    bot_val = res_b['result']['dice']['value'] if res_b and 'result' in res_b else random.randint(1, 6)
-                    game["bot_val"] = bot_val
+                    b_vals = roll_bot_series(chat_id, emoji, rolls_needed)
+                    game["current_bot_rolls"] = b_vals
+                    b_expr = "+".join(map(str, b_vals))
                     
-                    time.sleep(1)
-                    send_message(chat_id, f"🤖 Bot Roll: *{bot_val}*\n\n👉 *Now your turn! Please send the `{emoji}` emoji in chat to throw.*")
+                    send_message(chat_id, f"🤖 Bot Rolls: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now your turn! Please send `{emoji}` x{rolls_needed} in chat.*")
                 
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
         print(f"❌ Webhook Error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 200
-
-def finish_game(chat_id, user_id, user_val, bot_val, bet, emoji, mode):
-    global HOUSE_BALANCE
-    mode_tag = "🔥 (CRAZY MODE)" if mode == "crazy" else ""
-    res_text = f"📊 *Game Results ({emoji}) {mode_tag}*\n\n👤 You: *{user_val}*\n🤖 Bot: *{bot_val}*\n\n"
-    
-    is_win = False
-    is_tie = False
-    
-    if user_val == bot_val:
-        is_tie = True
-    elif mode == "crazy":
-        if user_val < bot_val:
-            is_win = True
-    else:
-        if user_val > bot_val:
-            is_win = True
-            
-    if is_tie:
-        user_balances[user_id] += bet
-        update_user_stats(user_id, emoji, bet, 0.0, False)
-        res_text += f"🤝 *It's a Tie!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-    elif is_win:
-        win = bet * 1.94
-        profit_inr = win - bet
-        user_balances[user_id] += win
-        HOUSE_BALANCE -= profit_inr
-        update_user_stats(user_id, emoji, bet, profit_inr, True)
-        res_text += f"🎉 *You WON {format_money(win, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-    else:
-        profit_inr = -bet
-        HOUSE_BALANCE += bet
-        update_user_stats(user_id, emoji, bet, profit_inr, False)
-        res_text += f"😢 *You Lost!* Bot wins.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-        
-    send_message(chat_id, res_text)
-    if user_id in active_games:
-        del active_games[user_id]
 
 @app.route('/zapupi-webhook', methods=['POST'])
 def zapupi_webhook():
@@ -982,7 +1094,7 @@ def zapupi_webhook():
                 if chat_id not in user_balances: 
                     user_balances[chat_id] = 0.0
                     user_currency[chat_id] = 'INR'
-                user_balances[user_id] += amount
+                user_balances[chat_id] += amount
                 
                 if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
                 user_deposits[chat_id] += amount
