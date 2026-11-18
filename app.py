@@ -16,7 +16,6 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ADMIN_USER_ID = 1822336097
 admin_list = {ADMIN_USER_ID}
 
-# Group Whitelist Storage (Approved Chat IDs)
 approved_groups = set()
 
 user_balances = {}
@@ -208,13 +207,10 @@ def telegram_webhook():
         if 'message' in data:
             message = data['message']
             chat_id = message['chat'].get('id')
-            chat_type = message['chat'].get('type') # 'private', 'group', 'supergroup'
+            chat_type = message['chat'].get('type')
             user_id = message['from'].get('id')
             
-            # --- GROUP WHITELIST SECURITY CHECK ---
             if chat_type in ['group', 'supergroup'] and chat_id not in approved_groups and user_id not in admin_list:
-                # Agar group approved nahi hai, aur user admin nahi hai, toh bot ignore karega
-                # Par agar koi group chat ID nikalne ke liye /myid ya group mein message dale, toh owner chat ID dekh sake
                 if 'text' in message and message['text'].startswith('/myid'):
                     send_message(chat_id, f"📌 This Group Chat ID is: `{chat_id}`")
                 return jsonify({'status': 'ok'}), 200
@@ -231,7 +227,6 @@ def telegram_webhook():
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
                 
-            # Handle Admin Interactive Input States
             if user_id in admin_list and user_id in admin_states and 'text' in message:
                 state = admin_states[user_id]
                 text = message['text'].strip()
@@ -397,7 +392,7 @@ def telegram_webhook():
                     send_message(chat_id, summary, reply_markup=keyboard)
                     return jsonify({'status': 'ok'}), 200
 
-            if user_id in admin_list and user_id in withdrawal_states and withdrawal_states[user_id].get('step'] == 'waiting_reject_reason' and 'text' in message:
+            if user_id in admin_list and user_id in withdrawal_states and withdrawal_states[user_id].get('step') == 'waiting_reject_reason' and 'text' in message:
                 reason = message['text'].strip()
                 target_user = withdrawal_states[user_id]['target_user']
                 amt_str = withdrawal_states[user_id]['amount_str']
@@ -439,7 +434,6 @@ def telegram_webhook():
             if 'text' in message:
                 text = message['text'].strip()
                 
-                # --- OWNER APPROVE COMMAND FOR GROUPS ---
                 if text.startswith('/approve '):
                     if user_id in admin_list:
                         parts = text.split(' ')
