@@ -275,7 +275,6 @@ def telegram_webhook():
                     if len(parts) == 2:
                         val_str = parts[1].replace('$', '').replace('₹', '')
                         if val_str.replace('.', '', 1).isdigit():
-                            # If admin typed in USDT (e.g. 300$), convert to INR base storage
                             if '$' in parts[1] or 'usdt' in parts[1].lower():
                                 HOUSE_BALANCE = float(val_str) * EXCHANGE_RATE
                             else:
@@ -439,4 +438,7 @@ def telegram_webhook():
                                 [
                                     {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
                                     {"text": "👤 You Roll First", "callback_data": "play_user_first"}
-                             
+                                ]
+                            ]
+                        }
+                        send_mess
