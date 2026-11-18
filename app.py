@@ -22,6 +22,7 @@ user_deposits = {}
 user_withdrawals = {}
 active_games = {}
 deposit_states = {}
+withdrawal_states = {}
 
 HOUSE_BALANCE = 100000.0
 MIN_BET = 10.0
@@ -193,6 +194,7 @@ def telegram_webhook():
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
                 
+            # Handle Deposit Input State
             if user_id in deposit_states and 'text' in message:
                 text = message['text'].strip()
                 del deposit_states[user_id]
@@ -203,6 +205,62 @@ def telegram_webhook():
                     send_message(chat_id, res_text)
                 else:
                     send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
+                return jsonify({'status': 'ok'}), 200
+
+            # Handle Withdrawal Flow (Amount -> UPI ID -> Confirm)
+            if user_id in withdrawal_states and 'text' in message:
+                state = withdrawal_states[user_id]
+                text = message['text'].strip()
+                
+                if state['step'] == 'waiting_amount':
+                    amt_inr = parse_user_amount(text, user_id)
+                    if not amt_inr or amt_inr <= 0:
+                        send_message(chat_id, "⚠️ Invalid amount. Please enter a valid number:")
+                        return jsonify({'status': 'ok'}), 200
+                    if user_balances[user_id] < amt_inr:
+                        send_message(chat_id, f"❌ Insufficient balance! Your balance is {format_money(user_balances[user_id], user_id)}.")
+                        del withdrawal_states[user_id]
+                        return jsonify({'status': 'ok'}), 200
+                        
+                    state['amount'] = amt_inr
+                    state['step'] = 'waiting_upi'
+                    send_message(chat_id, "🏦 *Please enter your UPI ID / Destination Address for payout:*")
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif state['step'] == 'waiting_upi':
+                    state['upi_id'] = text
+                    withdrawal_states[user_id]['step'] = 'confirming'
+                    
+                    amt_str = format_money(state['amount'], user_id)
+                    summary = (
+                        "📋 *Withdrawal Summary*\n\n"
+                        f"💰 Amount: *{amt_str}*\n"
+                        f"🏦 UPI ID: `{state['upi_id']}`\n\n"
+                        "Please verify your details below:"
+                    )
+                    keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "✅ Confirm Withdrawal", "callback_data": "wd_confirm"},
+                                {"text": "❌ Cancel", "callback_data": "wd_cancel"}
+                            ]
+                        ]
+                    }
+                    send_message(chat_id, summary, reply_markup=keyboard)
+                    return jsonify({'status': 'ok'}), 200
+
+            # Handle Admin Reject Reason Input State
+            if user_id == ADMIN_USER_ID and user_id in withdrawal_states and withdrawal_states[user_id].get('step') == 'waiting_reject_reason' and 'text' in message:
+                reason = message['text'].strip()
+                target_user = withdrawal_states[user_id]['target_user']
+                amt_str = withdrawal_states[user_id]['amount_str']
+                
+                # Refund balance back to user
+                user_balances[target_user] += withdrawal_states[user_id]['raw_amount']
+                
+                send_message(target_user, f"❌ *Withdrawal Request Rejected*\n\nAmount: {amt_str}\nReason: *{reason}*\n\nYour funds have been refunded to your wallet.")
+                send_message(chat_id, f"✅ Rejection sent to user `{target_user}` with reason: _{reason}_")
+                del withdrawal_states[user_id]
                 return jsonify({'status': 'ok'}), 200
 
             if 'dice' in message and user_id in active_games:
@@ -242,7 +300,8 @@ def telegram_webhook():
                         "- `/balance` - Check wallet balance\n"
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
-                        "- `/deposit <amount>` - Add money via ZapUPI\n\n"
+                        "- `/deposit <amount>` - Add money via ZapUPI\n"
+                        "- `/withdraw` - Withdraw your winnings\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "_🔥 Add `crazy` for Lowest Win mode! (e.g. `/dice 50 crazy`)_\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
@@ -252,7 +311,7 @@ def telegram_webhook():
                     
                 elif text == '/balance':
                     bal_str = format_money(user_balances[user_id], user_id)
-                    send_message(chat_id, f"💰 *Your Wallet Balance:* {bal_str}\n\nUse `/deposit <amount>` to add funds.")
+                    send_message(chat_id, f"💰 *Your Wallet Balance:* {bal_str}\n\nUse `/deposit` or `/withdraw` for transactions.")
                     
                 elif text == '/currency':
                     keyboard = {
@@ -283,7 +342,11 @@ def telegram_webhook():
                         send_message(chat_id, res_text)
                     else:
                         send_message(chat_id, "⚠️ Use format: `/deposit 100`")
-                        
+
+                elif text == '/withdraw':
+                    withdrawal_states[user_id] = {'step': 'waiting_amount'}
+                    send_message(chat_id, "💸 *Withdrawal Flow*\n\nPlease enter the amount you want to withdraw:")
+                    
                 elif text.startswith('/dr '):
                     parts = text.split(' ')
                     if len(parts) == 3 and parts[1].replace('.', '', 1).isdigit():
@@ -461,7 +524,6 @@ def telegram_webhook():
             message_id = query['message']['message_id']
             user_id = query['from']['id']
             
-            # Button click hote hi buttons ko gayab kar do
             remove_inline_keyboard(chat_id, message_id)
             
             if user_id not in user_balances:
@@ -473,7 +535,76 @@ def telegram_webhook():
                 send_message(chat_id, "✅ Currency successfully set to *INR (₹)*!")
             elif callback_data == "curr_usdt":
                 user_currency[user_id] = 'USDT'
-                send_message(chat_id, "✅ Currency successfully set to *USDT ($)*!")
+                send_message(chat_id, "✅ Currency successfully set to *USD ($)*!")
+                
+            elif callback_data == "wd_cancel":
+                if user_id in withdrawal_states:
+                    user_balances[user_id] += withdrawal_states[user_id].get('amount', 0)
+                    del withdrawal_states[user_id]
+                send_message(chat_id, "❌ Withdrawal request cancelled. Funds refunded.")
+                
+            elif callback_data == "wd_confirm":
+                if user_id in withdrawal_states:
+                    st = withdrawal_states[user_id]
+                    raw_amt = st['amount']
+                    if user_balances[user_id] < raw_amt:
+                        send_message(chat_id, "❌ Insufficient balance.")
+                        del withdrawal_states[user_id]
+                        return jsonify({'status': 'ok'}), 200
+                        
+                    user_balances[user_id] -= raw_amt
+                    if user_id not in user_withdrawals: user_withdrawals[user_id] = 0.0
+                    user_withdrawals[user_id] += raw_amt
+                    
+                    amt_str = format_money(raw_amt, user_id)
+                    upi_id = st['upi_id']
+                    
+                    send_message(chat_id, "📤 *Withdrawal Request Submitted!*\n\nYour request has been sent to the admin for verification. You will be notified once processed.")
+                    
+                    # Send to Admin with Paid and Reject buttons
+                    admin_msg = (
+                        "🚨 *NEW WITHDRAWAL REQUEST*\n\n"
+                        f"👤 User ID: `{user_id}`\n"
+                        f"💰 Amount: *{amt_str}*\n"
+                        f"🏦 UPI ID: `{upi_id}`"
+                    )
+                    admin_keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "✅ Paid", "callback_data": f"admin_wd_paid_{user_id}_{raw_amt}"},
+                                {"text": "❌ Reject", "callback_data": f"admin_wd_reject_{user_id}_{raw_amt}"}
+                            ]
+                        ]
+                    }
+                    send_message(ADMIN_USER_ID, admin_msg, reply_markup=admin_keyboard)
+                    del withdrawal_states[user_id]
+                
+            elif callback_data.startswith("admin_wd_paid_") or callback_data.startswith("admin_wd_reject_"):
+                if user_id == ADMIN_USER_ID:
+                    parts = callback_data.split('_')
+                    action = parts[2]
+                    target_user = int(parts[3])
+                    raw_amt = float(parts[4])
+                    amt_str = format_money(raw_amt, target_user)
+                    
+                    if action == "paid":
+                        success_msg = (
+                            "🎉 *Withdrawal Approved & Paid!* ✨\n\n"
+                            f"Dear User, your withdrawal of *{amt_str}* has been successfully processed and transferred to your account/UPI ID. 🚀\n\n"
+                            "Thank you for playing with *Xyren Pro Casino*! 🎰"
+                        )
+                        send_message(target_user, success_msg)
+                        send_message(chat_id, f"✅ Successfully marked withdrawal for user `{target_user}` as Paid.")
+                    elif action == "reject":
+                        withdrawal_states[ADMIN_USER_ID] = {
+                            'step': 'waiting_reject_reason',
+                            'target_user': target_user,
+                            'raw_amount': raw_amt,
+                            'amount_str': amt_str
+                        }
+                        send_message(chat_id, f"✍️ *Please enter the rejection reason for user `{target_user}` in chat:*")
+                else:
+                    send_message(chat_id, "⛔ Unauthorized.")
                 
             elif callback_data in ["play_user_first", "play_bot_first"]:
                 if user_id not in active_games:
@@ -568,7 +699,7 @@ def zapupi_webhook():
             if chat_id:
                 if chat_id not in user_balances: 
                     user_balances[chat_id] = 0.0
-                    user_currency[user_id] = 'INR'
+                    user_currency[chat_id] = 'INR'
                 user_balances[user_id] += amount
                 
                 if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
