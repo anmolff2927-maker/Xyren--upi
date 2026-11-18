@@ -80,7 +80,6 @@ def telegram_webhook():
     if not data:
         return jsonify({'status': 'error'}), 400
         
-    # 1. Handle User Manual Emoji Throw in Chat
     if 'message' in data:
         message = data['message']
         chat_id = message['chat'].get('id')
@@ -89,6 +88,7 @@ def telegram_webhook():
         if user_id not in user_balances:
             user_balances[user_id] = 100.0  # Free testing balance
             
+        # 1. Handle User Manual Emoji Throw in Chat
         if 'dice' in message and user_id in active_games:
             game = active_games[user_id]
             expected_emoji = game['emoji']
@@ -108,7 +108,6 @@ def telegram_webhook():
                     res_b = send_animated_game(chat_id, expected_emoji)
                     bot_val = res_b['result']['dice']['value'] if res_b and 'result' in res_b else random.randint(1, 6)
                     
-                    # Calculate results
                     finish_game(chat_id, user_id, user_val, bot_val, bet, expected_emoji)
                     return jsonify({'status': 'ok'}), 200
                     
@@ -351,21 +350,42 @@ def finish_game(chat_id, user_id, user_val, bot_val, bet, emoji):
 @app.route('/zapupi-webhook', methods=['POST'])
 def zapupi_webhook():
     data = request.get_json()
-    if not data: return jsonify({'status': 'error'}), 400
+    print(f"📥 ZapUPI Webhook Received: {data}")
     
-    if data.get('status') == 'Success':
+    if not data: 
+        return jsonify({'status': 'error', 'message': 'No data'}), 400
+    
+    order_id = data.get('order_id')
+    status = data.get('status')
+    amount = float(data.get('amount', 0))
+    utr = data.get('utr', '')
+    
+    if status and status.lower() == 'success':
         remark = data.get('remark', '')
+        chat_id = None
+        
         if '|' in remark:
             parts = remark.split('|')
-            if len(parts) > 1 and parts[1].isdigit():
-                chat_id = int(parts[1])
-                amt = float(data.get('amount', 0))
-                if chat_id not in user_balances: user_balances[chat_id] = 0.0
-                user_balances[user_id] += amt
-                send_message(chat_id, f"✅ *Deposit Successful!* Added: ₹{amt}\n💰 New Balance: ₹{user_balances[user_id]:.2f}")
+            for p in parts:
+                if p.isdigit():
+                    chat_id = int(p)
+                    break
+        elif remark.isdigit():
+            chat_id = int(remark)
+            
+        if chat_id:
+            if chat_id not in user_balances: 
+                user_balances[chat_id] = 0.0
+            user_balances[chat_id] += amount
+            
+            success_msg = f"✅ *Deposit Successful!* 🎉\n\nAdded: ₹{amount}\nNew Balance: ₹{user_balances[chat_id]:.2f}\nOrder ID: `{order_id}`\nUTR: `{utr}`"
+            send_message(chat_id, success_msg)
+            print(f"✅ Balance ₹{amount} added successfully to user {chat_id}")
+        else:
+            print(f"⚠️ Webhook error: Could not extract chat_id from remark: {remark}")
                 
     return jsonify({'status': 'ok'}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-        
+    
