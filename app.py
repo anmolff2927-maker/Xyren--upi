@@ -275,7 +275,11 @@ def telegram_webhook():
                     if len(parts) == 2:
                         val_str = parts[1].replace('$', '').replace('₹', '')
                         if val_str.replace('.', '', 1).isdigit():
-                            HOUSE_BALANCE = float(val_str)
+                            # If admin typed in USDT (e.g. 300$), convert to INR base storage
+                            if '$' in parts[1] or 'usdt' in parts[1].lower():
+                                HOUSE_BALANCE = float(val_str) * EXCHANGE_RATE
+                            else:
+                                HOUSE_BALANCE = float(val_str)
                             send_message(chat_id, f"✅ House Balance successfully updated to ₹{HOUSE_BALANCE:,.2f}")
                 else:
                     send_message(chat_id, "⛔ Unauthorized.")
@@ -287,8 +291,10 @@ def telegram_webhook():
                         val_str = parts[1].replace('$', '').replace('₹', '')
                         if val_str.replace('.', '', 1).isdigit():
                             deduct_amt = float(val_str)
+                            if '$' in parts[1]:
+                                deduct_amt = deduct_amt * EXCHANGE_RATE
                             HOUSE_BALANCE -= deduct_amt
-                            send_message(chat_id, f"✅ Deducted ₹{deduct_amt:,.2f} from House Balance. New HB: ₹{HOUSE_BALANCE:,.2f}")
+                            send_message(chat_id, f"✅ Deducted from House Balance. New HB: ₹{HOUSE_BALANCE:,.2f}")
                 else:
                     send_message(chat_id, "⛔ Unauthorized.")
                     
@@ -433,11 +439,4 @@ def telegram_webhook():
                                 [
                                     {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
                                     {"text": "👤 You Roll First", "callback_data": "play_user_first"}
-                                ]
-                            ]
-                        }
-                        send_message(chat_id, f"🎮 *Game Started* ({triggered_game} | Bet: {format_money(bet_inr, user_id)})\n\nChoose who rolls first:", reply_markup=keyboard)
-                        
-                elif text in ['/panel', '/admin']:
-                    if user_id == ADMIN_USER_ID:
-                        pan
+                             
