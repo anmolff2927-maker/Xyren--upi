@@ -1,132 +1,106 @@
 import os
-import logging
-from flask import Flask, request, jsonify
+import time
 import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# LOGGING SETUP
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# CONFIGURATIONS FROM RENDER ENVIRONMENT VARIABLES
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# Render Environment Variables se tokens uthayega
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-def send_telegram_message(chat_id, text):
+def send_message(chat_id, text):
+    """Telegram par user ko message bhejne ke liye function"""
+    url = f"{TELEGRAM_API_URL}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
     try:
-        requests.post(
-            TELEGRAM_URL,
-            json={"chat_id": chat_id, "text": text},
-            timeout=20
-        )
-    except Exception:
-        logger.exception("Telegram send error")
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending telegram message: {e}")
 
-@app.route("/", methods=["GET"])
-def home():
-    return "ZapUPI Telegram Payment Bot is running!"
+def create_zapupi_order(amount, chat_id):
+    """ZapUPI se payment link generate karne ke liye function"""
+    url = "https://pay.zapupi.com/api/create-order"
+    order_id = "ORD" + str(int(time.time() * 1000))
+    
+    payload = {
+        "zap_key": ZAPUPI_API_KEY,
+        "order_id": order_id,
+        "amount": str(amount),
+        "remark": f"Telegram|{chat_id}",
+        "webhook_url": "https://xyren-upi.onrender.com/zapupi-webhook"
+    }
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        data = response.json()
+        if data.get("status") == "success":
+            payment_url = data.get("payment_url")
+            return f"🔗 *Payment Link Generated!*\n\nAmount: ₹{amount}\nOrder ID: `{order_id}`\n\n[Click here to Pay]({payment_url})"
+        else:
+            return f"❌ Failed to generate payment link: {data.get('message', 'Unknown error')}"
+    except Exception as e:
+        return "⚠️ Failed to connect to payment gateway. Try again later."
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "online", "bot": "ZapUPI Payment Bot"})
+@app.route('/')
+def index():
+    return "Xyren UPI Bot is running live!", 200
 
-# 1. TELEGRAM WEBHOOK (Handles user messages)
-@app.route("/webhook", methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def telegram_webhook():
-    if not TELEGRAM_TOKEN:
-        return jsonify({"error": "Bot token missing"}), 500
-
-    try:
-        update = request.get_json(silent=True) or {}
-        message = update.get("message", {})
-
-        if not message:
-            return jsonify({"ok": True})
-
-        chat_id = message.get("chat", {}).get("id")
-        text = message.get("text", "").strip()
-
-        if not chat_id or not text:
-            return jsonify({"ok": True})
-
-        # Start Command
-        if text == "/start":
-            send_telegram_message(
-                chat_id,
-                "Welcome to ZapUPI Payment Bot 🚀\n\n"
-                "Please send the amount you want to pay (e.g., 50, 100, 500) to generate your payment link."
-            )
-            return jsonify({"ok": True})
-
-        # Check if user sent an amount (digits only)
-        if text.isdigit():
-            amount = text
-            
-            # ZapUPI API Request to generate payment link
-            # Note: Adjust the endpoint URL if ZapUPI documentation specifies a different one
-            zapupi_endpoint = "https://panel.zapupi.com/api/create_link" # Replace with exact ZapUPI endpoint if different
-            
-            payload = {
-                "api_key": ZAPUPI_API_KEY,
-                "amount": amount,
-                "customer_note": str(chat_id) # Passing chat_id in note to track payment later
-            }
-            
-            try:
-                zapupi_res = requests.post(zapupi_endpoint, json=payload, timeout=20)
-                res_data = zapupi_res.json()
-                
-                # Assuming ZapUPI returns a payment link in response (e.g., res_data['payment_url'])
-                payment_url = res_data.get("payment_url") or res_data.get("link")
-                
-                if payment_url:
-                    send_telegram_message(
-                        chat_id, 
-                        f"🔗 Payment Link Generated for ₹{amount}:\n{payment_url}\n\n"
-                        f"Please complete the payment. We will notify you here once successful!"
-                    )
-                else:
-                    send_telegram_message(chat_id, "Error generating payment link from gateway. Please try again.")
-            except Exception:
-                logger.exception("ZapUPI API call failed")
-                send_telegram_message(chat_id, "Failed to connect to payment gateway. Try again later.")
-
-            return jsonify({"ok": True})
-
-        send_telegram_message(chat_id, "Please send a valid amount in numbers (e.g., 100) to proceed.")
-        return jsonify({"ok": True})
-
-    except Exception:
-        logger.exception("Telegram webhook error")
-        return jsonify({"ok": True})
-
-# 2. ZAPUPI CALLBACK / WEBHOOK (Handles payment success notification from gateway)
-@app.route("/zapupi-webhook", methods=["POST"])
-def zapupi_callback():
-    try:
-        data = request.get_json(silent=True) or {}
-        logger.info(f"Received ZapUPI webhook data: {data}")
+    """Telegram se aane wale messages ko handle karne ke liye"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'status': 'error'}), 400
         
-        # Extract fields based on ZapUPI callback structure
-        status = data.get("status") # e.g., "SUCCESS" or "success"
-        amount = data.get("amount")
-        chat_id = data.get("customer_note") # Retrieving the chat_id we passed earlier
+    if 'message' in data:
+        message = data['message']
+        chat_id = message['chat'].get('id')
+        text = message.get('text', '').strip()
+        
+        if text == '/start':
+            send_message(chat_id, "👋 Welcome to Xyren UPI Bot!\n\nPlease send the amount in INR (e.g., `100`) to generate a payment link.")
+        elif text.isdigit():
+            send_message(chat_id, "⏳ Generating your payment link, please wait...")
+            response_text = create_zapupi_order(text, chat_id)
+            send_message(chat_id, response_text)
+        else:
+            send_message(chat_id, "💡 Please send a valid numeric amount (e.g., `100`) or type /start.")
+            
+    return jsonify({'status': 'ok'}), 200
 
-        if str(status).upper() == "SUCCESS" and chat_id:
-            send_telegram_message(
-                int(chat_id), 
-                f"✅ Payment of ₹{amount} Successful!\nYour account has been credited."
-            )
+@app.route('/zapupi-webhook', methods=['POST'])
+def zapupi_webhook():
+    """ZapUPI payment success/failure callback handle karne ke liye"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'status': 'error', 'message': 'No data'}), 400
+        
+    order_id = data.get('order_id')
+    status = data.get('status')   # Success | Failed
+    utr = data.get('utr', '')
+    
+    if status == 'Success':
+        print(f"Payment Successful for Order: {order_id}, UTR: {utr}")
+        remark = data.get('remark', '')
+        if '|' in remark:
+            parts = remark.split('|')
+            if len(parts) > 1 and parts[1].isdigit():
+                chat_id = int(parts[1])
+                send_message(chat_id, f"✅ *Payment Received Successfully!*\n\nOrder ID: `{order_id}`\nUTR: `{utr}`")
+                
+    return jsonify({'status': 'ok'}), 200
 
-        return jsonify({"status": "received"}), 200
-    except Exception:
-        logger.exception("ZapUPI callback error")
-        return jsonify({"status": "error"}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-      
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+    
