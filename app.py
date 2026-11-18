@@ -30,6 +30,8 @@ EXCHANGE_RATE = 98.0
 
 RIG_CONTROL = {
     "bj": 50.0,
+    "tower": 50.0,
+    "mines": 50.0,
     "limbo": 50.0
 }
 
@@ -256,9 +258,11 @@ def telegram_webhook():
                         "- `/deposit <amount>` - Add money via ZapUPI\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "_🔥 Add `crazy` for Lowest Win mode! (e.g. `/dice 50 crazy`)_\n\n"
-                        "🃏 *Card & Multiplier Games (Image Format):*\n"
+                        "🃏 *Mini Games:*\n"
                         "- `/bj <amount>` - Blackjack 21\n"
-                        "- `/limbo <amount> <multiplier>` - Limbo Game\n\n"
+                        "- `/limbo <amount> <multiplier>` - Limbo Game\n"
+                        "- `/tower <amount>` - Tower Climb\n"
+                        "- `/mines <amount>` - Minesweeper\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
@@ -303,6 +307,20 @@ def telegram_webhook():
                         val = float(text.split(' ')[1])
                         RIG_CONTROL["bj"] = val
                         send_message(chat_id, f"✅ Blackjack Bot Win Chance set to {val}%")
+                    else:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                elif text.startswith('/settower '):
+                    if user_id == ADMIN_USER_ID:
+                        val = float(text.split(' ')[1])
+                        RIG_CONTROL["tower"] = val
+                        send_message(chat_id, f"✅ Tower Bot Win Chance set to {val}%")
+                    else:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                elif text.startswith('/setmines '):
+                    if user_id == ADMIN_USER_ID:
+                        val = float(text.split(' ')[1])
+                        RIG_CONTROL["mines"] = val
+                        send_message(chat_id, f"✅ Mines Bot Win Chance set to {val}%")
                     else:
                         send_message(chat_id, "⛔ Unauthorized.")
                 elif text.startswith('/setlimbo '):
@@ -388,6 +406,62 @@ def telegram_webhook():
                             send_photo(chat_id, bio, caption=res_text)
                     else:
                         send_message(chat_id, "⚠️ Format: `/limbo <amount> <multiplier>`\nExample: `/limbo 50 2.0`")
+
+                elif text.startswith('/tower '):
+                    parts = text.split(' ')
+                    bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+                    if not bet_inr or bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        send_message(chat_id, f"⚠️ Invalid bet limits.")
+                    elif user_balances[user_id] < bet_inr:
+                        send_message(chat_id, "❌ Insufficient balance!")
+                    else:
+                        user_balances[user_id] -= bet_inr
+                        bot_win_chance = RIG_CONTROL["tower"]
+                        is_win = (random.random() * 100) >= bot_win_chance
+                        climbed_levels = random.randint(3, 5) if is_win else random.randint(0, 2)
+                        multiplier = 1.5 * climbed_levels if climbed_levels > 0 else 0.0
+                        
+                        if climbed_levels >= 3:
+                            win_amt = bet_inr * multiplier
+                            profit_inr = win_amt - bet_inr
+                            user_balances[user_id] += win_amt
+                            HOUSE_BALANCE -= profit_inr
+                            update_user_stats(user_id, "tower", bet_inr, profit_inr, True)
+                            res_text = f"🎉 *Successful Climb! Won {format_money(win_amt, user_id)}*!\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                        else:
+                            profit_inr = -bet_inr
+                            HOUSE_BALANCE += bet_inr
+                            update_user_stats(user_id, "tower", bet_inr, profit_inr, False)
+                            res_text = f"💥 *Fell from Tower!* You lost.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                        send_message(chat_id, f"🏰 *Tower Climb Results*\n\n🧗 Levels Climbed: *{climbed_levels}/5*\n⚡ Multiplier: *{multiplier}x*\n\n{res_text}")
+
+                elif text.startswith('/mines '):
+                    parts = text.split(' ')
+                    bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+                    if not bet_inr or bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        send_message(chat_id, f"⚠️ Invalid bet limits.")
+                    elif user_balances[user_id] < bet_inr:
+                        send_message(chat_id, "❌ Insufficient balance!")
+                    else:
+                        user_balances[user_id] -= bet_inr
+                        bot_win_chance = RIG_CONTROL["mines"]
+                        is_win = (random.random() * 100) >= bot_win_chance
+                        gems_found = random.randint(3, 6) if is_win else random.randint(0, 2)
+                        mult = 1.2 * gems_found if gems_found > 0 else 0.0
+                        
+                        if gems_found >= 3:
+                            win_amt = bet_inr * mult
+                            profit_inr = win_amt - bet_inr
+                            user_balances[user_id] += win_amt
+                            HOUSE_BALANCE -= profit_inr
+                            update_user_stats(user_id, "mines", bet_inr, profit_inr, True)
+                            res_text = f"🎉 *Safe! Won {format_money(win_amt, user_id)}*!\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                        else:
+                            profit_inr = -bet_inr
+                            HOUSE_BALANCE += bet_inr
+                            update_user_stats(user_id, "mines", bet_inr, profit_inr, False)
+                            res_text = f"💥 *Hit a Mine!* You lost.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                        send_message(chat_id, f"💣 *Minesweeper Results*\n\n💎 Gems Found: *{gems_found}*\n📈 Multiplier: *{mult:.2f}x*\n\n{res_text}")
 
                 elif text.startswith('/dr '):
                     parts = text.split(' ')
@@ -525,6 +599,7 @@ def telegram_webhook():
                                 "- `/maxbet <amount>` - Set Max Bet\n"
                                 "- `/setrate <rate>` - Set USD/INR Rate\n"
                                 "- `/setbj <pct>` | `/setlimbo <pct>`\n"
+                                "- `/settower <pct>` | `/setmines <pct>`\n"
                                 "- `/addbalance <user_id> <amount>`\n"
                                 "- `/users` - View all users\n"
                                 "- `/sendto <user_id> <message>`"
