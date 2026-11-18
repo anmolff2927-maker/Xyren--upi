@@ -16,21 +16,20 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # Tera Admin User ID
 ADMIN_USER_ID = 1822336097
 
-# Storage & Casino Settings (Stored in Base Currency INR internally)
+# Storage & Casino Settings
 user_balances = {}
-user_currency = {}     # 'INR' or 'USDT'
-user_stats = {}        # {user_id: {"games": 0, "wins": 0, "losses": 0, "total_pnl": 0.0, "biggest_win": 0.0, "game_counts": {}}}
-user_deposits = {}     # {user_id: total_deposit_inr}
-user_withdrawals = {}  # {user_id: total_withdrawal_inr}
+user_currency = {}
+user_stats = {}
+user_deposits = {}
+user_withdrawals = {}
 active_games = {}
 
-HOUSE_BALANCE = 100000.0  # Stored in INR
-MIN_BET = 10.0            # Default Min Bet in INR (₹10)
-MAX_BET = 1000.0          # Default Max Bet in INR (₹1000)
-EXCHANGE_RATE = 98.0      # 1 USD = ₹98
+HOUSE_BALANCE = 100000.0
+MIN_BET = 10.0
+MAX_BET = 1000.0
+EXCHANGE_RATE = 98.0
 
 def format_money(amount_in_inr, user_id):
-    """User ki selected currency ke hisab se amount format karta hai"""
     curr = user_currency.get(user_id, 'INR')
     if curr == 'USDT':
         val = amount_in_inr / EXCHANGE_RATE
@@ -39,7 +38,6 @@ def format_money(amount_in_inr, user_id):
         return f"₹{amount_in_inr:.2f}"
 
 def parse_user_amount(text_val, user_id):
-    """User ke input ko uski currency se INR mein convert karta hai"""
     try:
         val = float(text_val)
         curr = user_currency.get(user_id, 'INR')
@@ -75,7 +73,6 @@ def send_photo(chat_id, photo_bio, caption=""):
         print(f"Error sending photo: {e}")
 
 def generate_stats_image(user_id):
-    """Pillow use karke professional casino stats card banata hai"""
     stats = user_stats.get(user_id, {"games": 0, "wins": 0, "losses": 0, "total_pnl": 0.0, "biggest_win": 0.0, "game_counts": {}})
     total_games = stats["games"]
     wins = stats["wins"]
@@ -89,11 +86,9 @@ def generate_stats_image(user_id):
     game_counts = stats.get("game_counts", {})
     most_played = max(game_counts, key=game_counts.get) if game_counts else "None"
 
-    # Image setup (600x480)
     img = Image.new('RGB', (600, 480), color=(15, 15, 25))
     d = ImageDraw.Draw(img)
     
-    # Header bar
     d.rectangle([0, 0, 600, 75], fill=(30, 30, 50))
     d.text((25, 25), "📊 XYREN CASINO - PLAYER STATS", fill=(255, 215, 0))
     
@@ -102,7 +97,7 @@ def generate_stats_image(user_id):
         ("Total Games Played:", f"{total_games}"),
         ("Total Deposits:", format_money(total_dep, user_id)),
         ("Total Withdrawals:", format_money(total_wd, user_id)),
-        ("Most Played Game:", f"{most_played.upper()}"),
+        ("Most Played Game:", f"{str(most_played).upper()}"),
         ("Total PnL:", format_money(total_pnl, user_id)),
         ("Win Rate:", f"{win_rate:.1f}% ({wins}W / {losses}L)"),
         ("Biggest Lifetime Win:", format_money(biggest_win, user_id))
@@ -172,7 +167,7 @@ def create_zapupi_order(amount, chat_id):
 
 @app.route('/')
 def index():
-    return "Xyren Pro Casino Bot with Stats, House Balance & Currency is Live!", 200
+    return "Xyren Pro Casino Bot is Live!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
@@ -187,10 +182,9 @@ def telegram_webhook():
         user_id = message['from'].get('id')
         
         if user_id not in user_balances:
-            user_balances[user_id] = 100.0  # Free testing balance in INR
+            user_balances[user_id] = 100.0
             user_currency[user_id] = 'INR'
             
-        # 1. Handle Manual Emoji Throw
         if 'dice' in message and user_id in active_games:
             game = active_games[user_id]
             expected_emoji = game['emoji']
@@ -217,7 +211,6 @@ def telegram_webhook():
                     finish_game(chat_id, user_id, user_val, bot_val, bet, expected_emoji)
                     return jsonify({'status': 'ok'}), 200
 
-        # 2. Handle Text Commands
         if 'text' in message:
             text = message['text'].strip()
             
@@ -261,7 +254,6 @@ def telegram_webhook():
             elif text.startswith('/deposit '):
                 parts = text.split(' ')
                 if len(parts) > 1 and parts[1].replace('.', '', 1).isdigit():
-                    # Deposit amount entered in user's current currency, converted to INR for ZapUPI gateway
                     amt_inr = parse_user_amount(parts[1], user_id)
                     send_message(chat_id, "⏳ Generating deposit link...")
                     res_text = create_zapupi_order(amt_inr, user_id)
@@ -269,7 +261,6 @@ def telegram_webhook():
                 else:
                     send_message(chat_id, "⚠️ Use format: `/deposit 100`")
                     
-            # --- HOUSE BALANCE & CONFIG COMMANDS (Admin Only) ---
             elif text in ['/hb', '/housebal']:
                 if user_id == ADMIN_USER_ID:
                     hb_inr = HOUSE_BALANCE
@@ -284,10 +275,8 @@ def telegram_webhook():
                     if len(parts) == 2:
                         val_str = parts[1].replace('$', '').replace('₹', '')
                         if val_str.replace('.', '', 1).isdigit():
-                            HOUSE_BALANCE = float(val_str) # Assuming HB set in base or currency
+                            HOUSE_BALANCE = float(val_str)
                             send_message(chat_id, f"✅ House Balance successfully updated to ₹{HOUSE_BALANCE:,.2f}")
-                        else:
-                            send_message(chat_id, "⚠️ Invalid amount format.")
                 else:
                     send_message(chat_id, "⛔ Unauthorized.")
                     
@@ -334,7 +323,6 @@ def telegram_webhook():
                 else:
                     send_message(chat_id, "⛔ Unauthorized.")
 
-            # --- PREDICTION GAME: /dr ---
             elif text.startswith('/dr '):
                 parts = text.split(' ')
                 if len(parts) == 3 and parts[1].replace('.', '', 1).isdigit():
@@ -408,7 +396,6 @@ def telegram_webhook():
                 else:
                     send_message(chat_id, "⚠️ Format error! Use: `/dr <amount> <choice>`\nExample: `/dr 50 high` or `/dr 50 1,3,5`")
                     
-            # --- VERSUS GAMES COMMANDS ---
             else:
                 game_cmd_map = {
                     '/dice': '🎲',
@@ -434,4 +421,23 @@ def telegram_webhook():
                     if bet_inr is None or bet_inr <= 0:
                         send_message(chat_id, "⚠️ Enter a valid bet amount.")
                     elif bet_inr < MIN_BET or bet_inr > MAX_BET:
-                        send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {fo
+                        send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                    elif user_balances[user_id] < bet_inr:
+                        send_message(chat_id, "❌ Insufficient balance! Use `/deposit <amount>` to add money.")
+                    else:
+                        user_balances[user_id] -= bet_inr
+                        active_games[user_id] = {"bet": bet_inr, "emoji": triggered_game, "step": "selecting_turn"}
+                        
+                        keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
+                                    {"text": "👤 You Roll First", "callback_data": "play_user_first"}
+                                ]
+                            ]
+                        }
+                        send_message(chat_id, f"🎮 *Game Started* ({triggered_game} | Bet: {format_money(bet_inr, user_id)})\n\nChoose who rolls first:", reply_markup=keyboard)
+                        
+                elif text in ['/panel', '/admin']:
+                    if user_id == ADMIN_USER_ID:
+                        pan
