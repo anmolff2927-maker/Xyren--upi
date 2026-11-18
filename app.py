@@ -13,21 +13,32 @@ ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Admin & Co-Admins Storage
 ADMIN_USER_ID = 1822336097
+admin_list = {ADMIN_USER_ID}
 
 user_balances = {}
 user_currency = {}
 user_stats = {}
 user_deposits = {}
 user_withdrawals = {}
+deposit_history = []
+withdrawal_history = []
+banned_users = set()
+
 active_games = {}
 deposit_states = {}
 withdrawal_states = {}
+admin_states = {}
 
+# Global Toggles & Settings
 HOUSE_BALANCE = 100000.0
 MIN_BET = 10.0
 MAX_BET = 1000.0
 EXCHANGE_RATE = 98.0
+MAINTENANCE_MODE = False
+DEPOSIT_ENABLED = True
+WITHDRAW_ENABLED = True
 
 def format_money(amount_in_inr, user_id):
     curr = user_currency.get(user_id, 'INR')
@@ -179,7 +190,7 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
-    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE
+    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED
     try:
         data = request.get_json()
         if not data:
@@ -190,14 +201,131 @@ def telegram_webhook():
             chat_id = message['chat'].get('id')
             user_id = message['from'].get('id')
             
+            if user_id in banned_users:
+                send_message(chat_id, "⛔ Your account has been banned from using this bot.")
+                return jsonify({'status': 'ok'}), 200
+                
+            if MAINTENANCE_MODE and user_id not in admin_list:
+                send_message(chat_id, "🛠 *Bot is under Maintenance.* Please try again later.")
+                return jsonify({'status': 'ok'}), 200
+                
             if user_id not in user_balances:
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
                 
+            # Handle Admin Interactive Input States
+            if user_id in admin_list and user_id in admin_states and 'text' in message:
+                state = admin_states[user_id]
+                text = message['text'].strip()
+                action = state['action']
+                
+                if action == 'add_bal':
+                    try:
+                        parts = text.split(' ')
+                        t_user = int(parts[0])
+                        amt = parse_user_amount(parts[1], t_user)
+                        if t_user not in user_balances: user_balances[t_user] = 0.0
+                        user_balances[t_user] += amt
+                        send_message(chat_id, f"✅ Added {format_money(amt, t_user)} to user `{t_user}`.")
+                        send_message(t_user, f"💰 *Admin credited your account!* +{format_money(amt, t_user)}")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid format. Use: `<user_id> <amount>`")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'deduct_bal':
+                    try:
+                        parts = text.split(' ')
+                        t_user = int(parts[0])
+                        amt = parse_user_amount(parts[1], t_user)
+                        if t_user in user_balances:
+                            user_balances[t_user] = max(0.0, user_balances[t_user] - amt)
+                            send_message(chat_id, f"✅ Deducted {format_money(amt, t_user)} from user `{t_user}`.")
+                            send_message(t_user, f"⚠️ *Admin deducted from your account.* -{format_money(amt, t_user)}")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid format. Use: `<user_id> <amount>`")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'user_stats':
+                    try:
+                        target_u = int(text)
+                        bio = generate_stats_image(target_u)
+                        send_photo(chat_id, bio, caption=f"📊 Stats for User `{target_u}`")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid User ID.")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'ban_user':
+                    try:
+                        target_u = int(text)
+                        banned_users.add(target_u)
+                        send_message(chat_id, f"🚫 User `{target_u}` has been BANNED.")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid User ID.")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'unban_user':
+                    try:
+                        target_u = int(text)
+                        if target_u in banned_users: banned_users.remove(target_u)
+                        send_message(chat_id, f"✅ User `{target_u}` has been UNBANNED.")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid User ID.")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'grant_admin':
+                    try:
+                        target_u = int(text)
+                        admin_list.add(target_u)
+                        send_message(chat_id, f"👑 User `{target_u}` granted Admin rights.")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid User ID.")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'revoke_admin':
+                    try:
+                        target_u = int(text)
+                        if target_u != ADMIN_USER_ID and target_u in admin_list:
+                            admin_list.remove(target_u)
+                            send_message(chat_id, f"⛔ Admin rights revoked for `{target_u}`.")
+                    except:
+                        send_message(chat_id, "⚠️ Invalid User ID.")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'broadcast_all':
+                    count = 0
+                    for u in list(user_balances.keys()):
+                        send_message(u, f"📢 *Announcement*\n\n{text}")
+                        count += 1
+                    send_message(chat_id, f"✅ Broadcast sent to {count} users.")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+                    
+                elif action == 'broadcast_private':
+                    try:
+                        parts = text.split(' ', 1)
+                        target_u = int(parts[0])
+                        msg = parts[1]
+                        send_message(target_u, f"📢 *Admin Message*\n\n{msg}")
+                        send_message(chat_id, f"✅ Private message sent to `{target_u}`.")
+                    except:
+                        send_message(chat_id, "⚠️ Format error. Use: `<user_id> <message>`")
+                    del admin_states[user_id]
+                    return jsonify({'status': 'ok'}), 200
+
             # Handle Deposit Input State
             if user_id in deposit_states and 'text' in message:
                 text = message['text'].strip()
                 del deposit_states[user_id]
+                if not DEPOSIT_ENABLED:
+                    send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
+                    return jsonify({'status': 'ok'}), 200
                 amt_inr = parse_user_amount(text, user_id)
                 if amt_inr and amt_inr > 0:
                     send_message(chat_id, "⏳ Generating deposit link...")
@@ -207,12 +335,16 @@ def telegram_webhook():
                     send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
                 return jsonify({'status': 'ok'}), 200
 
-            # Handle Withdrawal Flow (Amount -> UPI ID -> Confirm)
+            # Handle Withdrawal Flow
             if user_id in withdrawal_states and 'text' in message:
                 state = withdrawal_states[user_id]
                 text = message['text'].strip()
                 
                 if state['step'] == 'waiting_amount':
+                    if not WITHDRAW_ENABLED:
+                        send_message(chat_id, "❌ Withdrawals are currently disabled by Admin.")
+                        del withdrawal_states[user_id]
+                        return jsonify({'status': 'ok'}), 200
                     amt_inr = parse_user_amount(text, user_id)
                     if not amt_inr or amt_inr <= 0:
                         send_message(chat_id, "⚠️ Invalid amount. Please enter a valid number:")
@@ -250,12 +382,11 @@ def telegram_webhook():
                     return jsonify({'status': 'ok'}), 200
 
             # Handle Admin Reject Reason Input State
-            if user_id == ADMIN_USER_ID and user_id in withdrawal_states and withdrawal_states[user_id].get('step') == 'waiting_reject_reason' and 'text' in message:
+            if user_id in admin_list and user_id in withdrawal_states and withdrawal_states[user_id].get('step') == 'waiting_reject_reason' and 'text' in message:
                 reason = message['text'].strip()
                 target_user = withdrawal_states[user_id]['target_user']
                 amt_str = withdrawal_states[user_id]['amount_str']
                 
-                # Refund balance back to user
                 user_balances[target_user] += withdrawal_states[user_id]['raw_amount']
                 
                 send_message(target_user, f"❌ *Withdrawal Request Rejected*\n\nAmount: {amt_str}\nReason: *{reason}*\n\nYour funds have been refunded to your wallet.")
@@ -300,7 +431,7 @@ def telegram_webhook():
                         "- `/balance` - Check wallet balance\n"
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
-                        "- `/deposit <amount>` - Add money via ZapUPI\n"
+                        "- `/deposit` - Add money via ZapUPI\n"
                         "- `/withdraw` - Withdraw your winnings\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "_🔥 Add `crazy` for Lowest Win mode! (e.g. `/dice 50 crazy`)_\n\n"
@@ -330,10 +461,16 @@ def telegram_webhook():
                     send_photo(chat_id, bio, caption=f"✨ *Stats for user `{user_id}`*")
                     
                 elif text == '/deposit':
+                    if not DEPOSIT_ENABLED:
+                        send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
+                        return jsonify({'status': 'ok'}), 200
                     deposit_states[user_id] = True
                     send_message(chat_id, "💳 *Please enter the amount you want to deposit (e.g. 200):*")
                     
                 elif text.startswith('/deposit '):
+                    if not DEPOSIT_ENABLED:
+                        send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
+                        return jsonify({'status': 'ok'}), 200
                     parts = text.split(' ')
                     if len(parts) > 1 and parts[1].replace('.', '', 1).isdigit():
                         amt_inr = parse_user_amount(parts[1], user_id)
@@ -344,9 +481,37 @@ def telegram_webhook():
                         send_message(chat_id, "⚠️ Use format: `/deposit 100`")
 
                 elif text == '/withdraw':
+                    if not WITHDRAW_ENABLED:
+                        send_message(chat_id, "❌ Withdrawals are currently disabled by Admin.")
+                        return jsonify({'status': 'ok'}), 200
                     withdrawal_states[user_id] = {'step': 'waiting_amount'}
                     send_message(chat_id, "💸 *Withdrawal Flow*\n\nPlease enter the amount you want to withdraw:")
                     
+                elif text in ['/panel', '/admin']:
+                    if user_id in admin_list:
+                        panel_text = (
+                            "👑 *Owner & Admin Control Dashboard*\n\n"
+                            f"🛠 *Maintenance:* {'🟢 OFF' if not MAINTENANCE_MODE else '🔴 ON'}\n"
+                            f"💳 *Deposits:* {'🟢 Enabled' if DEPOSIT_ENABLED else '🔴 Disabled'}\n"
+                            f"💸 *Withdrawals:* {'🟢 Enabled' if WITHDRAW_ENABLED else '🔴 Disabled'}\n"
+                            f"🏦 *House Balance:* ₹{HOUSE_BALANCE:,.2f}"
+                        )
+                        admin_keyboard = {
+                            "inline_keyboard": [
+                                [{"text": "➕ Add Balance", "callback_data": "adm_add_bal"}, {"text": "➖ Deduct Balance", "callback_data": "adm_deduct_bal"}],
+                                [{"text": "📊 User Stats", "callback_data": "adm_user_stats"}, {"text": "👥 User List", "callback_data": "adm_users"}],
+                                [{"text": "🚫 Ban User", "callback_data": "adm_ban"}, {"text": "✅ Unban User", "callback_data": "adm_unban"}],
+                                [{"text": "📥 Last 50 Deposits", "callback_data": "adm_last_dep"}, {"text": "📤 Last 50 Withdraws", "callback_data": "adm_last_wd"}],
+                                [{"text": "👑 Grant Admin", "callback_data": "adm_grant"}, {"text": "⛔ Revoke Admin", "callback_data": "adm_revoke"}],
+                                [{"text": "📢 Broadcast All", "callback_data": "adm_bc_all"}, {"text": "💬 Broadcast Private", "callback_data": "adm_bc_priv"}],
+                                [{"text": "🛠 Toggle Maintenance", "callback_data": "adm_toggle_maint"}],
+                                [{"text": "💳 Toggle Deposit", "callback_data": "adm_toggle_dep"}, {"text": "💸 Toggle Withdraw", "callback_data": "adm_toggle_wd"}]
+                            ]
+                        }
+                        send_message(chat_id, panel_text, reply_markup=admin_keyboard)
+                    else:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        
                 elif text.startswith('/dr '):
                     parts = text.split(' ')
                     if len(parts) == 3 and parts[1].replace('.', '', 1).isdigit():
@@ -470,52 +635,6 @@ def telegram_webhook():
                                 ]
                             }
                             send_message(chat_id, f"🎮 *Game Started* ({triggered_game} | {mode_title})\n💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:", reply_markup=keyboard)
-                            
-                    elif text in ['/panel', '/admin']:
-                        if user_id == ADMIN_USER_ID:
-                            panel_text = (
-                                "👑 *Owner Admin Control Panel*\n\n"
-                                "Commands:\n"
-                                "- `/hb` - Check House Balance\n"
-                                "- `/sethb <amount>` - Set House Balance\n"
-                                "- `/deducthb <amount>` - Deduct HB\n"
-                                "- `/minbet <amount>` - Set Min Bet\n"
-                                "- `/maxbet <amount>` - Set Max Bet\n"
-                                "- `/setrate <rate>` - Set USD/INR Rate\n"
-                                "- `/addbalance <user_id> <amount>`\n"
-                                "- `/users` - View all users\n"
-                                "- `/sendto <user_id> <message>`"
-                            )
-                            send_message(chat_id, panel_text)
-                        else:
-                            send_message(chat_id, "⛔ Unauthorized.")
-                            
-                    elif text.startswith('/addbalance '):
-                        if user_id == ADMIN_USER_ID:
-                            parts = text.split(' ')
-                            if len(parts) == 3 and parts[1].isdigit():
-                                t_user = int(parts[1])
-                                amt = parse_user_amount(parts[2], user_id)
-                                if t_user not in user_balances: user_balances[t_user] = 0.0
-                                user_balances[t_user] += amt
-                                send_message(chat_id, f"✅ Updated User `{t_user}`. New Bal: {format_money(user_balances[t_user], t_user)}")
-                                send_message(t_user, f"💰 *Admin updated your balance!* New Balance: {format_money(user_balances[t_user], t_user)}")
-                            else:
-                                send_message(chat_id, "⚠️ Format: `/addbalance <user_id> <amount>`")
-                                
-                    elif text == '/users':
-                        if user_id == ADMIN_USER_ID:
-                            txt = "👥 *Users & Balances:*\n"
-                            for uid, bal in user_balances.items(): 
-                                txt += f"- `{uid}`: {format_money(bal, uid)}\n"
-                            send_message(chat_id, txt)
-                            
-                    elif text.startswith('/sendto '):
-                        if user_id == ADMIN_USER_ID:
-                            parts = text.split(' ', 2)
-                            if len(parts) >= 3 and parts[1].isdigit():
-                                send_message(int(parts[1]), f"📢 *Admin Message:*\n\n{parts[2]}")
-                                send_message(chat_id, "✅ Message sent successfully!")
 
         elif 'callback_query' in data:
             query = data['callback_query']
@@ -524,7 +643,9 @@ def telegram_webhook():
             message_id = query['message']['message_id']
             user_id = query['from']['id']
             
-            remove_inline_keyboard(chat_id, message_id)
+            # Non-admin buttons (like currency selection or game start) can auto-hide
+            if not callback_data.startswith("adm_"):
+                remove_inline_keyboard(chat_id, message_id)
             
             if user_id not in user_balances:
                 user_balances[user_id] = 0.0
@@ -536,6 +657,68 @@ def telegram_webhook():
             elif callback_data == "curr_usdt":
                 user_currency[user_id] = 'USDT'
                 send_message(chat_id, "✅ Currency successfully set to *USD ($)*!")
+                
+            # --- ADMIN PANEL BUTTON HANDLERS (PERSISTENT BUTTONS) ---
+            elif callback_data.startswith("adm_"):
+                if user_id not in admin_list:
+                    send_message(chat_id, "⛔ Unauthorized.")
+                    return jsonify({'status': 'ok'}), 200
+                    
+                if callback_data == "adm_add_bal":
+                    admin_states[user_id] = {'action': 'add_bal'}
+                    send_message(chat_id, "➕ *Enter User ID and Amount to add*\nFormat: `<user_id> <amount>`")
+                elif callback_data == "adm_deduct_bal":
+                    admin_states[user_id] = {'action': 'deduct_bal'}
+                    send_message(chat_id, "➖ *Enter User ID and Amount to deduct*\nFormat: `<user_id> <amount>`")
+                elif callback_data == "adm_user_stats":
+                    admin_states[user_id] = {'action': 'user_stats'}
+                    send_message(chat_id, "📊 *Enter User ID to view stats:*")
+                elif callback_data == "adm_users":
+                    txt = "👥 *Registered Users & Balances:*\n"
+                    for uid, bal in user_balances.items():
+                        status = "🔴 BANNED" if uid in banned_users else "🟢 Active"
+                        txt.text if hasattr(txt, 'text') else None
+                        txt += f"- `{uid}`: {format_money(bal, uid)} [{status}]\n"
+                    send_message(chat_id, txt)
+                elif callback_data == "adm_ban":
+                    admin_states[user_id] = {'action': 'ban_user'}
+                    send_message(chat_id, "🚫 *Enter User ID to Ban:*")
+                elif callback_data == "adm_unban":
+                    admin_states[user_id] = {'action': 'unban_user'}
+                    send_message(chat_id, "✅ *Enter User ID to Unban:*")
+                elif callback_data == "adm_last_dep":
+                    txt = "📥 *Last 50 Deposits:*\n"
+                    for d in deposit_history[-50:]:
+                        txt += f"- User `{d['user']}`: {format_money(d['amount'], d['user'])} (UTR: `{d['utr']}`)\n"
+                    if not deposit_history: txt += "No deposits recorded yet."
+                    send_message(chat_id, txt)
+                elif callback_data == "adm_last_wd":
+                    txt = "📤 *Last 50 Withdrawals:*\n"
+                    for w in withdrawal_history[-50:]:
+                        txt += f"- User `{w['user']}`: {format_money(w['amount'], w['user'])} to `{w['upi']}`\n"
+                    if not withdrawal_history: txt += "No withdrawals recorded yet."
+                    send_message(chat_id, txt)
+                elif callback_data == "adm_grant":
+                    admin_states[user_id] = {'action': 'grant_admin'}
+                    send_message(chat_id, "👑 *Enter User ID to grant Admin rights:*")
+                elif callback_data == "adm_revoke":
+                    admin_states[user_id] = {'action': 'revoke_admin'}
+                    send_message(chat_id, "⛔ *Enter User ID to revoke Admin rights:*")
+                elif callback_data == "adm_bc_all":
+                    admin_states[user_id] = {'action': 'broadcast_all'}
+                    send_message(chat_id, "📢 *Enter message to broadcast to all users:*")
+                elif callback_data == "adm_bc_priv":
+                    admin_states[user_id] = {'action': 'broadcast_private'}
+                    send_message(chat_id, "💬 *Enter User ID and Message*\nFormat: `<user_id> <message>`")
+                elif callback_data == "adm_toggle_maint":
+                    MAINTENANCE_MODE = not MAINTENANCE_MODE
+                    send_message(chat_id, f"🛠 Maintenance Mode is now: {'🔴 ON' if MAINTENANCE_MODE else '🟢 OFF'}")
+                elif callback_data == "adm_toggle_dep":
+                    DEPOSIT_ENABLED = not DEPOSIT_ENABLED
+                    send_message(chat_id, f"💳 Deposits are now: {'🟢 Enabled' if DEPOSIT_ENABLED else '🔴 Disabled'}")
+                elif callback_data == "adm_toggle_wd":
+                    WITHDRAW_ENABLED = not WITHDRAW_ENABLED
+                    send_message(chat_id, f"💸 Withdrawals are now: {'🟢 Enabled' if WITHDRAW_ENABLED else '🔴 Disabled'}")
                 
             elif callback_data == "wd_cancel":
                 if user_id in withdrawal_states:
@@ -556,12 +739,13 @@ def telegram_webhook():
                     if user_id not in user_withdrawals: user_withdrawals[user_id] = 0.0
                     user_withdrawals[user_id] += raw_amt
                     
+                    withdrawal_history.append({'user': user_id, 'amount': raw_amt, 'upi': st['upi_id']})
+                    
                     amt_str = format_money(raw_amt, user_id)
                     upi_id = st['upi_id']
                     
                     send_message(chat_id, "📤 *Withdrawal Request Submitted!*\n\nYour request has been sent to the admin for verification. You will be notified once processed.")
                     
-                    # Send to Admin with Paid and Reject buttons
                     admin_msg = (
                         "🚨 *NEW WITHDRAWAL REQUEST*\n\n"
                         f"👤 User ID: `{user_id}`\n"
@@ -580,7 +764,7 @@ def telegram_webhook():
                     del withdrawal_states[user_id]
                 
             elif callback_data.startswith("admin_wd_paid_") or callback_data.startswith("admin_wd_reject_"):
-                if user_id == ADMIN_USER_ID:
+                if user_id in admin_list:
                     parts = callback_data.split('_')
                     action = parts[2]
                     target_user = int(parts[3])
@@ -596,7 +780,7 @@ def telegram_webhook():
                         send_message(target_user, success_msg)
                         send_message(chat_id, f"✅ Successfully marked withdrawal for user `{target_user}` as Paid.")
                     elif action == "reject":
-                        withdrawal_states[ADMIN_USER_ID] = {
+                        withdrawal_states[user_id] = {
                             'step': 'waiting_reject_reason',
                             'target_user': target_user,
                             'raw_amount': raw_amt,
@@ -704,6 +888,8 @@ def zapupi_webhook():
                 
                 if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
                 user_deposits[chat_id] += amount
+                
+                deposit_history.append({'user': chat_id, 'amount': amount, 'utr': utr})
                 
                 success_msg = f"✅ *Deposit Successful!* 🎉\n\nAdded: {format_money(amount, chat_id)}\nNew Balance: {format_money(user_balances[chat_id], chat_id)}\nOrder ID: `{order_id}`\nUTR: `{utr}`"
                 send_message(chat_id, success_msg)
