@@ -13,7 +13,6 @@ ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# Admin & Co-Admins Storage
 ADMIN_USER_ID = 1822336097
 admin_list = {ADMIN_USER_ID}
 
@@ -31,7 +30,6 @@ deposit_states = {}
 withdrawal_states = {}
 admin_states = {}
 
-# Global Toggles & Settings
 HOUSE_BALANCE = 100000.0
 MIN_BET = 10.0
 MAX_BET = 1000.0
@@ -64,11 +62,19 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=5)
         return res.json()
     except Exception as e:
         print(f"Error sending message: {e}")
         return None
+
+def answer_callback(callback_query_id, text=""):
+    url = f"{TELEGRAM_API_URL}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id, "text": text}
+    try:
+        requests.post(url, json=payload, timeout=3)
+    except Exception as e:
+        print(f"Error answering callback: {e}")
 
 def remove_inline_keyboard(chat_id, message_id):
     url = f"{TELEGRAM_API_URL}/editMessageReplyMarkup"
@@ -78,7 +84,7 @@ def remove_inline_keyboard(chat_id, message_id):
         "reply_markup": {"inline_keyboard": []}
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=3)
     except Exception as e:
         print(f"Error removing keyboard: {e}")
 
@@ -87,7 +93,7 @@ def send_photo(chat_id, photo_bio, caption=""):
     files = {'photo': ('game.png', photo_bio, 'image/png')}
     data = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
     try:
-        requests.post(url, files=files, data=data, timeout=15)
+        requests.post(url, files=files, data=data, timeout=10)
     except Exception as e:
         print(f"Error sending photo: {e}")
 
@@ -155,7 +161,7 @@ def send_animated_game(chat_id, emoji):
     url = f"{TELEGRAM_API_URL}/sendDice"
     payload = {"chat_id": chat_id, "emoji": emoji}
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=5)
         return res.json()
     except Exception as e:
         print(f"Error sending game: {e}")
@@ -175,7 +181,7 @@ def create_zapupi_order(amount, chat_id):
     
     headers = {"Content-Type": "application/json"}
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
         data = response.json()
         if data.get("status") == "success":
             return f"🔗 *Deposit Link Generated!*\n\nAmount: ₹{amount}\nOrder ID: `{order_id}`\n\n[Click here to Pay & Add Money]({data.get('payment_url')})"
@@ -213,7 +219,6 @@ def telegram_webhook():
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
                 
-            # Handle Admin Interactive Input States
             if user_id in admin_list and user_id in admin_states and 'text' in message:
                 state = admin_states[user_id]
                 text = message['text'].strip()
@@ -319,7 +324,6 @@ def telegram_webhook():
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
 
-            # Handle Deposit Input State
             if user_id in deposit_states and 'text' in message:
                 text = message['text'].strip()
                 del deposit_states[user_id]
@@ -335,7 +339,6 @@ def telegram_webhook():
                     send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
                 return jsonify({'status': 'ok'}), 200
 
-            # Handle Withdrawal Flow
             if user_id in withdrawal_states and 'text' in message:
                 state = withdrawal_states[user_id]
                 text = message['text'].strip()
@@ -381,7 +384,6 @@ def telegram_webhook():
                     send_message(chat_id, summary, reply_markup=keyboard)
                     return jsonify({'status': 'ok'}), 200
 
-            # Handle Admin Reject Reason Input State
             if user_id in admin_list and user_id in withdrawal_states and withdrawal_states[user_id].get('step') == 'waiting_reject_reason' and 'text' in message:
                 reason = message['text'].strip()
                 target_user = withdrawal_states[user_id]['target_user']
@@ -638,12 +640,15 @@ def telegram_webhook():
 
         elif 'callback_query' in data:
             query = data['callback_query']
+            callback_query_id = query['id']
             callback_data = query['data']
             chat_id = query['message']['chat']['id']
             message_id = query['message']['message_id']
             user_id = query['from']['id']
             
-            # Non-admin buttons (like currency selection or game start) can auto-hide
+            # 🚀 TURANT LOADING SPINNER HATAO (Yeh hold fix karega!)
+            answer_callback(callback_query_id)
+            
             if not callback_data.startswith("adm_"):
                 remove_inline_keyboard(chat_id, message_id)
             
@@ -658,7 +663,6 @@ def telegram_webhook():
                 user_currency[user_id] = 'USDT'
                 send_message(chat_id, "✅ Currency successfully set to *USD ($)*!")
                 
-            # --- ADMIN PANEL BUTTON HANDLERS (PERSISTENT BUTTONS) ---
             elif callback_data.startswith("adm_"):
                 if user_id not in admin_list:
                     send_message(chat_id, "⛔ Unauthorized.")
@@ -677,7 +681,6 @@ def telegram_webhook():
                     txt = "👥 *Registered Users & Balances:*\n"
                     for uid, bal in user_balances.items():
                         status = "🔴 BANNED" if uid in banned_users else "🟢 Active"
-                        txt.text if hasattr(txt, 'text') else None
                         txt += f"- `{uid}`: {format_money(bal, uid)} [{status}]\n"
                     send_message(chat_id, txt)
                 elif callback_data == "adm_ban":
