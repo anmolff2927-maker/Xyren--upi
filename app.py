@@ -10,6 +10,7 @@ app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
+BOT_USERNAME = "@Xyren_upibot"
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -117,7 +118,7 @@ def generate_stats_image(user_id):
     d = ImageDraw.Draw(img)
     
     d.rectangle([0, 0, 600, 75], fill=(30, 30, 50))
-    d.text((25, 25), "📊 XYREN CASINO - PLAYER STATS", fill=(255, 215, 0))
+    d.text((25, 25), f"📊 {BOT_USERNAME} - PLAYER STATS", fill=(255, 215, 0))
     
     y = 100
     items = [
@@ -194,7 +195,7 @@ def create_zapupi_order(amount, chat_id):
 
 @app.route('/')
 def index():
-    return "Xyren Pro Casino Bot is Live!", 200
+    return f"{BOT_USERNAME} Casino Bot is Live!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
@@ -449,7 +450,7 @@ def telegram_webhook():
 
                 if text == '/start':
                     help_text = (
-                        "🎰 *Welcome to Xyren Pro Casino!* 🎲\n\n"
+                        f"🎰 *Welcome to {BOT_USERNAME} Casino!* 🎲\n\n"
                         "Commands:\n"
                         "- `/balance` or `/bal` - Check wallet balance\n"
                         "- `/currency` - Change currency (INR / USDT)\n"
@@ -820,7 +821,7 @@ def telegram_webhook():
                         success_msg = (
                             "🎉 *Withdrawal Approved & Paid!* ✨\n\n"
                             f"Dear User, your withdrawal of *{amt_str}* has been successfully processed and transferred to your account/UPI ID. 🚀\n\n"
-                            "Thank you for playing with *Xyren Pro Casino*! 🎰"
+                            f"Thank you for playing with *{BOT_USERNAME}*! 🎰"
                         )
                         send_message(target_user, success_msg)
                         send_message(chat_id, f"✅ Successfully marked withdrawal for user `{target_user}` as Paid.")
