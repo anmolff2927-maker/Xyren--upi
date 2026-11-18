@@ -208,7 +208,7 @@ def telegram_webhook():
         if 'message' in data:
             message = data['message']
             chat_id = message['chat'].get('id')
-            chat_type = message['chat'].get('type')
+            chat_type = message['chat'].get('type') # 'private', 'group', 'supergroup'
             user_id = message['from'].get('id')
             
             if chat_type in ['group', 'supergroup'] and chat_id not in approved_groups and user_id not in admin_list:
@@ -335,63 +335,78 @@ def telegram_webhook():
 
             if user_id in deposit_states and 'text' in message:
                 text = message['text'].strip()
-                del deposit_states[user_id]
-                if not DEPOSIT_ENABLED:
-                    send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
+                if chat_type != 'private':
+                    del deposit_states[user_id]
+                    send_message(chat_id, "❌ Deposit can only be done in Bot's DM (Private Chat)!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
                     return jsonify({'status': 'ok'}), 200
-                amt_inr = parse_user_amount(text, user_id)
-                if amt_inr and amt_inr > 0:
-                    send_message(chat_id, "⏳ Generating deposit link...")
-                    res_text = create_zapupi_order(amt_inr, user_id)
-                    send_message(chat_id, res_text)
+
+                if text.startswith('/'):  
+                    del deposit_states[user_id]
                 else:
-                    send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
-                return jsonify({'status': 'ok'}), 200
+                    del deposit_states[user_id]
+                    if not DEPOSIT_ENABLED:
+                        send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
+                        return jsonify({'status': 'ok'}), 200
+                    amt_inr = parse_user_amount(text, user_id)
+                    if amt_inr and amt_inr > 0:
+                        send_message(chat_id, "⏳ Generating deposit link...")
+                        res_text = create_zapupi_order(amt_inr, user_id)
+                        send_message(chat_id, res_text)
+                    else:
+                        send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
+                    return jsonify({'status': 'ok'}), 200
 
             if user_id in withdrawal_states and 'text' in message:
                 state = withdrawal_states[user_id]
                 text = message['text'].strip()
-                
-                if state['step'] == 'waiting_amount':
-                    if not WITHDRAW_ENABLED:
-                        send_message(chat_id, "❌ Withdrawals are currently disabled by Admin.")
-                        del withdrawal_states[user_id]
-                        return jsonify({'status': 'ok'}), 200
-                    amt_inr = parse_user_amount(text, user_id)
-                    if not amt_inr or amt_inr <= 0:
-                        send_message(chat_id, "⚠️ Invalid amount. Please enter a valid number:")
-                        return jsonify({'status': 'ok'}), 200
-                    if user_balances[user_id] < amt_inr:
-                        send_message(chat_id, f"❌ Insufficient balance! Your balance is {format_money(user_balances[user_id], user_id)}.")
-                        del withdrawal_states[user_id]
+                if chat_type != 'private':
+                    del withdrawal_states[user_id]
+                    send_message(chat_id, "❌ Withdrawal can only be done in Bot's DM (Private Chat)!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
+                    return jsonify({'status': 'ok'}), 200
+
+                if text.startswith('/'):
+                    del withdrawal_states[user_id]
+                else:
+                    if state['step'] == 'waiting_amount':
+                        if not WITHDRAW_ENABLED:
+                            send_message(chat_id, "❌ Withdrawals are currently disabled by Admin.")
+                            del withdrawal_states[user_id]
+                            return jsonify({'status': 'ok'}), 200
+                        amt_inr = parse_user_amount(text, user_id)
+                        if not amt_inr or amt_inr <= 0:
+                            send_message(chat_id, "⚠️ Invalid amount. Please enter a valid number:")
+                            return jsonify({'status': 'ok'}), 200
+                        if user_balances[user_id] < amt_inr:
+                            send_message(chat_id, f"❌ Insufficient balance! Your balance is {format_money(user_balances[user_id], user_id)}.")
+                            del withdrawal_states[user_id]
+                            return jsonify({'status': 'ok'}), 200
+                            
+                        state['amount'] = amt_inr
+                        state['step'] = 'waiting_upi'
+                        send_message(chat_id, "🏦 *Please enter your UPI ID / Destination Address for payout:*")
                         return jsonify({'status': 'ok'}), 200
                         
-                    state['amount'] = amt_inr
-                    state['step'] = 'waiting_upi'
-                    send_message(chat_id, "🏦 *Please enter your UPI ID / Destination Address for payout:*")
-                    return jsonify({'status': 'ok'}), 200
-                    
-                elif state['step'] == 'waiting_upi':
-                    state['upi_id'] = text
-                    withdrawal_states[user_id]['step'] = 'confirming'
-                    
-                    amt_str = format_money(state['amount'], user_id)
-                    summary = (
-                        "📋 *Withdrawal Summary*\n\n"
-                        f"💰 Amount: *{amt_str}*\n"
-                        f"🏦 UPI ID: `{state['upi_id']}`\n\n"
-                        "Please verify your details below:"
-                    )
-                    keyboard = {
-                        "inline_keyboard": [
-                            [
-                                {"text": "✅ Confirm Withdrawal", "callback_data": "wd_confirm"},
-                                {"text": "❌ Cancel", "callback_data": "wd_cancel"}
+                    elif state['step'] == 'waiting_upi':
+                        state['upi_id'] = text
+                        withdrawal_states[user_id]['step'] = 'confirming'
+                        
+                        amt_str = format_money(state['amount'], user_id)
+                        summary = (
+                            "📋 *Withdrawal Summary*\n\n"
+                            f"💰 Amount: *{amt_str}*\n"
+                            f"🏦 UPI ID: `{state['upi_id']}`\n\n"
+                            "Please verify your details below:"
+                        )
+                        keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "✅ Confirm Withdrawal", "callback_data": "wd_confirm"},
+                                    {"text": "❌ Cancel", "callback_data": "wd_cancel"}
+                                ]
                             ]
-                        ]
-                    }
-                    send_message(chat_id, summary, reply_markup=keyboard)
-                    return jsonify({'status': 'ok'}), 200
+                        }
+                        send_message(chat_id, summary, reply_markup=keyboard)
+                        return jsonify({'status': 'ok'}), 200
 
             if user_id in admin_list and user_id in withdrawal_states and withdrawal_states[user_id].get('step') == 'waiting_reject_reason' and 'text' in message:
                 reason = message['text'].strip()
@@ -455,8 +470,8 @@ def telegram_webhook():
                         "- `/balance` or `/bal` - Check wallet balance\n"
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
-                        "- `/deposit` - Add money via ZapUPI\n"
-                        "- `/withdraw` - Withdraw your winnings\n\n"
+                        "- `/deposit` - Add money via ZapUPI (DM Only)\n"
+                        "- `/withdraw` - Withdraw your winnings (DM Only)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "_🔥 Add `crazy` for Lowest Win mode! (e.g. `/dice 50 crazy`)_\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
@@ -465,16 +480,32 @@ def telegram_webhook():
                     send_message(chat_id, help_text)
                     
                 elif text in ['/balance', '/bal']:
+                    if user_id in deposit_states: del deposit_states[user_id]
+                    if user_id in withdrawal_states: del withdrawal_states[user_id]
+                    
                     bal_str = format_money(user_balances[user_id], user_id)
-                    bal_keyboard = {
-                        "inline_keyboard": [
-                            [
-                                {"text": "💳 Deposit", "callback_data": "btn_deposit"},
-                                {"text": "💸 Withdraw", "callback_data": "btn_withdraw"}
+                    
+                    # 🚀 Yahan check kiya: Agar group mein hai toh Deposit/Withdraw ke buttons nahi dikhenge!
+                    if chat_type == 'private':
+                        bal_keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "💳 Deposit", "callback_data": "btn_deposit"},
+                                    {"text": "💸 Withdraw", "callback_data": "btn_withdraw"}
+                                ]
                             ]
-                        ]
-                    }
-                    send_message(chat_id, f"💰 *Your Wallet Balance:* {bal_str}", reply_markup=bal_keyboard)
+                        }
+                        send_message(chat_id, f"💰 *Your Wallet Balance:* {bal_str}", reply_markup=bal_keyboard)
+                    else:
+                        # Group mein sirf balance dikhega, aur DM ka button hoga
+                        bal_keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "📥 Manage Balance in DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}
+                                ]
+                            ]
+                        }
+                        send_message(chat_id, f"💰 *Your Wallet Balance:* {bal_str}\n\n_ℹ️ Deposit & Withdraw can only be done in Bot's DM!_", reply_markup=bal_keyboard)
                     
                 elif text == '/currency':
                     keyboard = {
@@ -493,6 +524,10 @@ def telegram_webhook():
                     send_photo(chat_id, bio, caption=f"✨ *Stats for user `{user_id}`*")
                     
                 elif text == '/deposit':
+                    if chat_type != 'private':
+                        send_message(chat_id, f"❌ Deposit command can only be used in Bot's DM (Private Chat)!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
+                        return jsonify({'status': 'ok'}), 200
+
                     if not DEPOSIT_ENABLED:
                         send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
                         return jsonify({'status': 'ok'}), 200
@@ -500,6 +535,10 @@ def telegram_webhook():
                     send_message(chat_id, "💳 *Please enter the amount you want to deposit (e.g. 200):*")
                     
                 elif text.startswith('/deposit '):
+                    if chat_type != 'private':
+                        send_message(chat_id, f"❌ Deposit command can only be used in Bot's DM (Private Chat)!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
+                        return jsonify({'status': 'ok'}), 200
+
                     if not DEPOSIT_ENABLED:
                         send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
                         return jsonify({'status': 'ok'}), 200
@@ -513,6 +552,10 @@ def telegram_webhook():
                         send_message(chat_id, "⚠️ Use format: `/deposit 100`")
 
                 elif text == '/withdraw':
+                    if chat_type != 'private':
+                        send_message(chat_id, f"❌ Withdrawal command can only be used in Bot's DM (Private Chat)!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
+                        return jsonify({'status': 'ok'}), 200
+
                     if not WITHDRAW_ENABLED:
                         send_message(chat_id, "❌ Withdrawals are currently disabled by Admin.")
                         return jsonify({'status': 'ok'}), 200
@@ -554,7 +597,7 @@ def telegram_webhook():
                             send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                             return jsonify({'status': 'ok'}), 200
                         elif user_balances[user_id] < bet_inr:
-                            send_message(chat_id, "❌ Insufficient balance! Use `/deposit` to add money.")
+                            send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
                             return jsonify({'status': 'ok'}), 200
                             
                         is_win = False
@@ -652,7 +695,7 @@ def telegram_webhook():
                         elif bet_inr < MIN_BET or bet_inr > MAX_BET:
                             send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                         elif user_balances[user_id] < bet_inr:
-                            send_message(chat_id, "❌ Insufficient balance! Use `/deposit` to add money.")
+                            send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
                         else:
                             user_balances[user_id] -= bet_inr
                             active_games[user_id] = {"bet": bet_inr, "emoji": triggered_game, "mode": mode, "step": "selecting_turn"}
@@ -673,6 +716,7 @@ def telegram_webhook():
             callback_query_id = query['id']
             callback_data = query['data']
             chat_id = query['message']['chat']['id']
+            chat_type = query['message']['chat']['type']
             message_id = query['message']['message_id']
             user_id = query['from']['id']
             
@@ -693,6 +737,10 @@ def telegram_webhook():
                 send_message(chat_id, "✅ Currency successfully set to *USD ($)*!")
                 
             elif callback_data == "btn_deposit":
+                if chat_type != 'private':
+                    send_message(chat_id, f"❌ Deposit can only be done in Bot's DM!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
+                    return jsonify({'status': 'ok'}), 200
+
                 if not DEPOSIT_ENABLED:
                     send_message(chat_id, "❌ Deposits are currently disabled by Admin.")
                     return jsonify({'status': 'ok'}), 200
@@ -700,6 +748,10 @@ def telegram_webhook():
                 send_message(chat_id, "💳 *Please enter the amount you want to deposit (e.g. 200):*")
                 
             elif callback_data == "btn_withdraw":
+                if chat_type != 'private':
+                    send_message(chat_id, f"❌ Withdrawal can only be done in Bot's DM!", reply_markup={"inline_keyboard": [[{"text": "🤖 Open Bot DM", "url": f"https://t.me/{BOT_USERNAME.replace('@','')}"}]]})
+                    return jsonify({'status': 'ok'}), 200
+
                 if not WITHDRAW_ENABLED:
                     send_message(chat_id, "❌ Withdrawals are currently disabled by Admin.")
                     return jsonify({'status': 'ok'}), 200
@@ -930,7 +982,7 @@ def zapupi_webhook():
                 if chat_id not in user_balances: 
                     user_balances[chat_id] = 0.0
                     user_currency[chat_id] = 'INR'
-                user_balances[chat_id] += amount
+                user_balances[user_id] += amount
                 
                 if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
                 user_deposits[chat_id] += amount
