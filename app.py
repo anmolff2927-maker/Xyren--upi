@@ -23,11 +23,20 @@ user_stats = {}
 user_deposits = {}
 user_withdrawals = {}
 active_games = {}
+deposit_states = {}
 
 HOUSE_BALANCE = 100000.0
 MIN_BET = 10.0
 MAX_BET = 1000.0
 EXCHANGE_RATE = 98.0
+
+# Admin Win-Rate Rigging Controls (Bot Win Percentage)
+RIG_CONTROL = {
+    "bj": 50.0,
+    "tower": 50.0,
+    "mines": 50.0,
+    "limbo": 50.0
+}
 
 def format_money(amount_in_inr, user_id):
     curr = user_currency.get(user_id, 'INR')
@@ -65,7 +74,7 @@ def send_message(chat_id, text, reply_markup=None):
 
 def send_photo(chat_id, photo_bio, caption=""):
     url = f"{TELEGRAM_API_URL}/sendPhoto"
-    files = {'photo': ('stats.png', photo_bio, 'image/png')}
+    files = {'photo': ('game.png', photo_bio, 'image/png')}
     data = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
     try:
         requests.post(url, files=files, data=data, timeout=15)
@@ -107,6 +116,24 @@ def generate_stats_image(user_id):
         d.text((30, y), label, fill=(180, 180, 200))
         d.text((340, y), val, fill=(0, 255, 127) if "PnL" not in label or total_pnl >= 0 else (255, 69, 0))
         y += 42
+        
+    bio = io.BytesIO()
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    return bio
+
+def generate_game_card_image(title, details_list, bg_color=(20, 20, 35)):
+    img = Image.new('RGB', (500, 320), color=bg_color)
+    d = ImageDraw.Draw(img)
+    
+    d.rectangle([0, 0, 500, 60], fill=(40, 40, 70))
+    d.text((20, 20), title, fill=(255, 215, 0))
+    
+    y = 85
+    for label, val in details_list:
+        d.text((25, y), label, fill=(180, 180, 200))
+        d.text((280, y), val, fill=(255, 255, 255))
+        y += 35
         
     bio = io.BytesIO()
     img.save(bio, 'PNG')
@@ -186,6 +213,19 @@ def telegram_webhook():
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
                 
+            # Handle interactive deposit amount input
+            if user_id in deposit_states and 'text' in message:
+                text = message['text'].strip()
+                del deposit_states[user_id]
+                amt_inr = parse_user_amount(text, user_id)
+                if amt_inr and amt_inr > 0:
+                    send_message(chat_id, "⏳ Generating deposit link...")
+                    res_text = create_zapupi_order(amt_inr, user_id)
+                    send_message(chat_id, res_text)
+                else:
+                    send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
+                return jsonify({'status': 'ok'}), 200
+
             if 'dice' in message and user_id in active_games:
                 game = active_games[user_id]
                 expected_emoji = game['emoji']
@@ -224,11 +264,13 @@ def telegram_webhook():
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
                         "- `/deposit <amount>` - Add money via ZapUPI\n\n"
-                        "🎮 *Versus Games (1.94x Multiplier):*\n"
-                        "- `/dice <amount>` 🎲 | `/dart <amount>` 🎯\n"
-                        "- `/foot <amount>` ⚽ | `/basket <amount>` 🏀\n"
-                        "- `/bowl <amount>` 🎳\n"
+                        "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "_🔥 Add `crazy` for Lowest Win mode! (e.g. `/dice 50 crazy`)_\n\n"
+                        "🃏 *New Mini Games (Image Format):*\n"
+                        "- `/bj <amount>` - Blackjack 21\n"
+                        "- `/limbo <amount> <multiplier>` - Limbo Game\n"
+                        "- `/tower <amount>` - Tower Climb\n"
+                        "- `/mines <amount>` - Minesweeper\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
@@ -254,6 +296,10 @@ def telegram_webhook():
                     bio = generate_stats_image(user_id)
                     send_photo(chat_id, bio, caption=f"✨ *Stats for user `{user_id}`*")
                     
+                elif text == '/deposit':
+                    deposit_states[user_id] = True
+                    send_message(chat_id, "💳 *Please enter the amount you want to deposit (e.g. 200):*")
+                    
                 elif text.startswith('/deposit '):
                     parts = text.split(' ')
                     if len(parts) > 1 and parts[1].replace('.', '', 1).isdigit():
@@ -264,366 +310,129 @@ def telegram_webhook():
                     else:
                         send_message(chat_id, "⚠️ Use format: `/deposit 100`")
                         
-                elif text in ['/hb', '/housebal']:
+                # --- RIGGING / WIN-RATE ADMIN COMMANDS ---
+                elif text.startswith('/setbj '):
                     if user_id == ADMIN_USER_ID:
-                        hb_inr = HOUSE_BALANCE
-                        hb_usdt = hb_inr / EXCHANGE_RATE
-                        send_message(chat_id, f"🏦 *House Balance (HB):*\n- ₹{hb_inr:,.2f} INR\n- ${hb_usdt:,.2f} USDT\n- *Current Rate:* 1$ = ₹{EXCHANGE_RATE}")
+                        val = float(text.split(' ')[1])
+                        RIG_CONTROL["bj"] = val
+                        send_message(chat_id, f"✅ Blackjack Bot Win Chance set to {val}%")
                     else:
                         send_message(chat_id, "⛔ Unauthorized.")
-                        
-                elif text.startswith('/sethb '):
+                elif text.startswith('/settower '):
                     if user_id == ADMIN_USER_ID:
-                        parts = text.split(' ')
-                        if len(parts) == 2:
-                            val_str = parts[1].replace('$', '').replace('₹', '')
-                            if val_str.replace('.', '', 1).isdigit():
-                                if '$' in parts[1] or 'usdt' in parts[1].lower():
-                                    HOUSE_BALANCE = float(val_str) * EXCHANGE_RATE
-                                else:
-                                    HOUSE_BALANCE = float(val_str)
-                                send_message(chat_id, f"✅ House Balance successfully updated to ₹{HOUSE_BALANCE:,.2f}")
+                        val = float(text.split(' ')[1])
+                        RIG_CONTROL["tower"] = val
+                        send_message(chat_id, f"✅ Tower Bot Win Chance set to {val}%")
                     else:
                         send_message(chat_id, "⛔ Unauthorized.")
-                        
-                elif text.startswith('/deducthb '):
+                elif text.startswith('/setmines '):
                     if user_id == ADMIN_USER_ID:
-                        parts = text.split(' ')
-                        if len(parts) == 2:
-                            val_str = parts[1].replace('$', '').replace('₹', '')
-                            if val_str.replace('.', '', 1).isdigit():
-                                deduct_amt = float(val_str)
-                                if '$' in parts[1]:
-                                    deduct_amt = deduct_amt * EXCHANGE_RATE
-                                HOUSE_BALANCE -= deduct_amt
-                                send_message(chat_id, f"✅ Deducted from House Balance. New HB: ₹{HOUSE_BALANCE:,.2f}")
+                        val = float(text.split(' ')[1])
+                        RIG_CONTROL["mines"] = val
+                        send_message(chat_id, f"✅ Mines Bot Win Chance set to {val}%")
                     else:
                         send_message(chat_id, "⛔ Unauthorized.")
-                        
-                elif text.startswith('/minbet '):
+                elif text.startswith('/setlimbo '):
                     if user_id == ADMIN_USER_ID:
-                        parts = text.split(' ')
-                        if len(parts) == 2:
-                            amt = parse_user_amount(parts[1], user_id)
-                            if amt:
-                                MIN_BET = amt
-                                send_message(chat_id, f"✅ Minimum Bet set to {format_money(MIN_BET, user_id)}")
-                    else:
-                        send_message(chat_id, "⛔ Unauthorized.")
-                        
-                elif text.startswith('/maxbet '):
-                    if user_id == ADMIN_USER_ID:
-                        parts = text.split(' ')
-                        if len(parts) == 2:
-                            amt = parse_user_amount(parts[1], user_id)
-                            if amt:
-                                MAX_BET = amt
-                                send_message(chat_id, f"✅ Maximum Bet set to {format_money(MAX_BET, user_id)}")
-                    else:
-                        send_message(chat_id, "⛔ Unauthorized.")
-                        
-                elif text.startswith('/setrate '):
-                    if user_id == ADMIN_USER_ID:
-                        parts = text.split(' ')
-                        if len(parts) == 2 and parts[1].replace('.', '', 1).isdigit():
-                            EXCHANGE_RATE = float(parts[1])
-                            send_message(chat_id, f"✅ Exchange Rate updated successfully!\n1 USDT = ₹{EXCHANGE_RATE}")
+                        val = float(text.split(' ')[1])
+                        RIG_CONTROL["limbo"] = val
+                        send_message(chat_id, f"✅ Limbo Bot Win Chance set to {val}%")
                     else:
                         send_message(chat_id, "⛔ Unauthorized.")
 
-                elif text.startswith('/dr '):
+                # --- NEW GAMES: BLACKJACK, LIMBO, TOWER, MINES ---
+                elif text.startswith('/bj '):
                     parts = text.split(' ')
-                    if len(parts) == 3 and parts[1].replace('.', '', 1).isdigit():
-                        bet_inr = parse_user_amount(parts[1], user_id)
-                        arg = parts[2].lower()
+                    bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+                    if not bet_inr or bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        send_message(chat_id, f"⚠️ Invalid bet! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                    elif user_balances[user_id] < bet_inr:
+                        send_message(chat_id, "❌ Insufficient balance! Use `/deposit` to add money.")
+                    else:
+                        user_balances[user_id] -= bet_inr
+                        # Blackjack rigged outcome using RIG_CONTROL["bj"]
+                        bot_win_chance = RIG_CONTROL["bj"]
+                        is_win = random.random() * 100 >= bot_win_chance
                         
-                        if bet_inr < MIN_BET or bet_inr > MAX_BET:
-                            send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
-                            return jsonify({'status': 'ok'}), 200
-                        elif user_balances[user_id] < bet_inr:
-                            send_message(chat_id, "❌ Insufficient balance! Use `/deposit <amount>` to add money.")
-                            return jsonify({'status': 'ok'}), 200
-                            
-                        is_win = False
-                        multiplier = 0.0
-                        win_desc = ""
+                        p_score = random.randint(18, 21) if is_win else random.randint(12, 17)
+                        d_score = random.randint(12, 17) if is_win else random.randint(18, 21)
+                        if p_score == d_score: p_score += 1
                         
-                        if arg in ['high', 'low', 'odd', 'even']:
-                            user_balances[user_id] -= bet_inr
-                            send_message(chat_id, f"🎲 Rolling dice for Prediction (*{arg.upper()}* | Bet: {format_money(bet_inr, user_id)})...")
-                            
-                            res = send_animated_game(chat_id, '🎲')
-                            dice_val = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
-                            time.sleep(1)
-                            
-                            if arg == 'high' and dice_val in [4, 5, 6]: is_win = True
-                            elif arg == 'low' and dice_val in [1, 2, 3]: is_win = True
-                            elif arg == 'odd' and dice_val in [1, 3, 5]: is_win = True
-                            elif arg == 'even' and dice_val in [2, 4, 6]: is_win = True
-                            
-                            multiplier = 1.92
-                            win_desc = f"Prediction: {arg.upper()}"
+                        res_text = f"🃏 *Blackjack 21 Table*\n\n👤 Your Hand: *{p_score}*\n🤖 Dealer Hand: *{d_score}*\n\n"
+                        if p_score > 21 or (d_score <= 21 and d_score >= p_score):
+                            is_win = False
                         else:
-                            try:
-                                nums = [int(n.strip()) for n in arg.split(',')]
-                                if not all(1 <= n <= 6 for n in nums) or len(nums) > 5 or len(nums) != len(set(nums)):
-                                    raise ValueError()
-                                    
-                                user_balances[user_id] -= bet_inr
-                                send_message(chat_id, f"🎲 Rolling dice for Numbers (*{nums}* | Bet: {format_money(bet_inr, user_id)})...")
-                                
-                                res = send_animated_game(chat_id, '🎲')
-                                dice_val = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
-                                time.sleep(1)
-                                
-                                if dice_val in nums: is_win = True
-                                
-                                count = len(nums)
-                                mult_map = {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15}
-                                multiplier = mult_map.get(count, 1.0)
-                                win_desc = f"Numbers: {nums}"
-                            except:
-                                send_message(chat_id, "⚠️ Invalid format! Use `high`, `low`, `odd`, `even` or numbers like `2,4,6`.\nExample: `/dr 50 2,4,6`")
-                                return jsonify({'status': 'ok'}), 200
-                                
-                        result_text = f"📊 *Dice Prediction Result*\n\n🎲 Rolled Number: *{dice_val}*\n🎯 {win_desc}\n\n"
+                            is_win = True
+                            
+                        profit_inr = 0.0
                         if is_win:
-                            win_amt = bet_inr * multiplier
+                            win_amt = bet_inr * 2.0
                             profit_inr = win_amt - bet_inr
                             user_balances[user_id] += win_amt
                             HOUSE_BALANCE -= profit_inr
-                            update_user_stats(user_id, "prediction", bet_inr, profit_inr, True)
-                            result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{multiplier}x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                            update_user_stats(user_id, "blackjack", bet_inr, profit_inr, True)
+                            res_text += f"🎉 *You WON {format_money(win_amt, user_id)}*! 🥳"
                         else:
                             profit_inr = -bet_inr
                             HOUSE_BALANCE += bet_inr
-                            update_user_stats(user_id, "prediction", bet_inr, profit_inr, False)
-                            result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                            update_user_stats(user_id, "blackjack", bet_inr, profit_inr, False)
+                            res_text += f"😢 *Dealer wins!* You lost."
                             
-                        send_message(chat_id, result_text)
-                    else:
-                        send_message(chat_id, "⚠️ Format error! Use: `/dr <amount> <choice>`\nExample: `/dr 50 high` or `/dr 50 1,3,5`")
-                        
-                else:
-                    game_cmd_map = {
-                        '/dice': '🎲',
-                        '/dart': '🎯',
-                        '/foot': '⚽',
-                        '/basket': '🏀',
-                        '/bowl': '🎳'
-                    }
-                    
-                    triggered_game = None
-                    for cmd, emoji in game_cmd_map.items():
-                        if text.startswith(cmd):
-                            triggered_game = emoji
-                            break
-                    
-                    if triggered_game:
-                        parts = text.split(' ')
-                        bet_inr = parse_user_amount("10", user_id)
-                        mode = "normal"
-                        
-                        if len(parts) > 1:
-                            if parts[1].lower() == 'crazy':
-                                mode = "crazy"
-                                if len(parts) > 2:
-                                    bet_inr = parse_user_amount(parts[2], user_id)
-                            else:
-                                bet_inr = parse_user_amount(parts[1], user_id)
-                                if len(parts) > 2 and parts[2].lower() == 'crazy':
-                                    mode = "crazy"
-                                    
-                        if bet_inr is None or bet_inr <= 0:
-                            send_message(chat_id, "⚠️ Enter a valid bet amount.")
-                        elif bet_inr < MIN_BET or bet_inr > MAX_BET:
-                            send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                        bio = generate_game_card_image("BLACKJACK 21 TABLE", [("Your Cards:", f"Score {p_score}"), ("Dealer Cards:", f"Score {d_score}"), ("Result:", "WIN" if is_win else "LOSS")])
+                        send_photo(chat_id, bio, caption=res_text)
+
+                elif text.startswith('/limbo '):
+                    parts = text.split(' ')
+                    if len(parts) >= 3:
+                        bet_inr = parse_user_amount(parts[1], user_id)
+                        try:
+                            target_mult = float(parts[2])
+                        except:
+                            target_mult = 2.0
+                            
+                        if not bet_inr or bet_inr < MIN_BET or bet_inr > MAX_BET:
+                            send_message(chat_id, "⚠️ Invalid bet amount or limits.")
                         elif user_balances[user_id] < bet_inr:
-                            send_message(chat_id, "❌ Insufficient balance! Use `/deposit <amount>` to add money.")
+                            send_message(chat_id, "❌ Insufficient balance!")
                         else:
                             user_balances[user_id] -= bet_inr
-                            active_games[user_id] = {"bet": bet_inr, "emoji": triggered_game, "mode": mode, "step": "selecting_turn"}
+                            bot_win_chance = RIG_CONTROL["limbo"]
+                            is_win = random.random() * 100 >= bot_win_chance
                             
-                            mode_title = "🔥 CRAZY MODE (Lowest Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Wins)"
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [
-                                        {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
-                                        {"text": "👤 You Roll First", "callback_data": "play_user_first"}
-                                    ]
-                                ]
-                            }
-                            send_message(chat_id, f"🎮 *Game Started* ({triggered_game} | {mode_title})\n💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:", reply_markup=keyboard)
+                            landed = target_mult + round(random.uniform(0.1, 2.0), 2) if is_win else max(1.0, target_mult - round(random.uniform(0.1, 1.5), 2))
                             
-                    elif text in ['/panel', '/admin']:
-                        if user_id == ADMIN_USER_ID:
-                            panel_text = (
-                                "👑 *Owner Admin Control Panel*\n\n"
-                                "Commands:\n"
-                                "- `/hb` - Check House Balance\n"
-                                "- `/sethb <amount>` - Set House Balance\n"
-                                "- `/deducthb <amount>` - Deduct HB\n"
-                                "- `/minbet <amount>` - Set Min Bet\n"
-                                "- `/maxbet <amount>` - Set Max Bet\n"
-                                "- `/setrate <rate>` - Set USD/INR Rate\n"
-                                "- `/addbalance <user_id> <amount>`\n"
-                                "- `/users` - View all users\n"
-                                "- `/sendto <user_id> <message>`"
-                            )
-                            send_message(chat_id, panel_text)
-                        else:
-                            send_message(chat_id, "⛔ Unauthorized.")
-                            
-                    elif text.startswith('/addbalance '):
-                        if user_id == ADMIN_USER_ID:
-                            parts = text.split(' ')
-                            if len(parts) == 3 and parts[1].isdigit():
-                                t_user = int(parts[1])
-                                amt = parse_user_amount(parts[2], user_id)
-                                if t_user not in user_balances: user_balances[t_user] = 0.0
-                                user_balances[t_user] += amt
-                                send_message(chat_id, f"✅ Updated User `{t_user}`. New Bal: {format_money(user_balances[t_user], t_user)}")
-                                send_message(t_user, f"💰 *Admin updated your balance!* New Balance: {format_money(user_balances[t_user], t_user)}")
+                            res_text = f"🚀 *Limbo Game Results*\n\n🎯 Target: *{target_mult}x*\n📈 Landed: *{landed}x*\n\n"
+                            if landed >= target_mult:
+                                win_amt = bet_inr * target_mult
+                                profit_inr = win_amt - bet_inr
+                                user_balances[user_id] += win_amt
+                                HOUSE_BALANCE -= profit_inr
+                                update_user_stats(user_id, "limbo", bet_inr, profit_inr, True)
+                                res_text += f"🎉 *Hit Target! You WON {format_money(win_amt, user_id)}*!"
                             else:
-                                send_message(chat_id, "⚠️ Format: `/addbalance <user_id> <amount>`")
+                                profit_inr = -bet_inr
+                                HOUSE_BALANCE += bet_inr
+                                update_user_stats(user_id, "limbo", bet_inr, profit_inr, False)
+                                res_text += f"💥 *Crashed!* You lost."
                                 
-                    elif text == '/users':
-                        if user_id == ADMIN_USER_ID:
-                            txt = "👥 *Users & Balances:*\n"
-                            for uid, bal in user_balances.items(): 
-                                txt += f"- `{uid}`: {format_money(bal, uid)}\n"
-                            send_message(chat_id, txt)
-                            
-                    elif text.startswith('/sendto '):
-                        if user_id == ADMIN_USER_ID:
-                            parts = text.split(' ', 2)
-                            if len(parts) >= 3 and parts[1].isdigit():
-                                send_message(int(parts[1]), f"📢 *Admin Message:*\n\n{parts[2]}")
-                                send_message(chat_id, "✅ Message sent successfully!")
+                            bio = generate_game_card_image("LIMBO MULTIPLIER", [("Target Multiplier:", f"{target_mult}x"), ("Landed Multiplier:", f"{landed}x"), ("Outcome:", "SUCCESS" if landed >= target_mult else "CRASHED")])
+                            send_photo(chat_id, bio, caption=res_text)
+                    else:
+                        send_message(chat_id, "⚠️ Format: `/limbo <amount> <multiplier>`\nExample: `/limbo 50 2.0`")
 
-        elif 'callback_query' in data:
-            query = data['callback_query']
-            callback_data = query['data']
-            chat_id = query['message']['chat']['id']
-            user_id = query['from']['id']
-            
-            if user_id not in user_balances:
-                user_balances[user_id] = 0.0
-                user_currency[user_id] = 'INR'
-                
-            if callback_data == "curr_inr":
-                user_currency[user_id] = 'INR'
-                send_message(chat_id, "✅ Currency successfully set to *INR (₹)*!")
-            elif callback_data == "curr_usdt":
-                user_currency[user_id] = 'USDT'
-                send_message(chat_id, "✅ Currency successfully set to *USDT ($)*!")
-                
-            elif callback_data in ["play_user_first", "play_bot_first"]:
-                if user_id not in active_games:
-                    send_message(chat_id, "⚠️ Session expired. Start a new game.")
-                    return jsonify({'status': 'ok'}), 200
-                    
-                game = active_games[user_id]
-                emoji = game["emoji"]
-                
-                if callback_data == "play_user_first":
-                    game["step"] = "waiting_user_first"
-                    send_message(chat_id, f"👤 You chose to roll first!\n\n👉 *Please send the `{emoji}` emoji in chat now to make your throw!*")
-                else:
-                    game["step"] = "waiting_user_second"
-                    send_message(chat_id, f"🤖 Bot is throwing {emoji} first...")
-                    
-                    res_b = send_animated_game(chat_id, emoji)
-                    bot_val = res_b['result']['dice']['value'] if res_b and 'result' in res_b else random.randint(1, 6)
-                    game["bot_val"] = bot_val
-                    
-                    time.sleep(1)
-                    send_message(chat_id, f"🤖 Bot Roll: *{bot_val}*\n\n👉 *Now your turn! Please send the `{emoji}` emoji in chat to throw.*")
-                
-        return jsonify({'status': 'ok'}), 200
-    except Exception as e:
-        print(f"❌ Webhook Error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 200
-
-def finish_game(chat_id, user_id, user_val, bot_val, bet, emoji, mode):
-    global HOUSE_BALANCE
-    mode_tag = "🔥 (CRAZY MODE)" if mode == "crazy" else ""
-    res_text = f"📊 *Game Results ({emoji}) {mode_tag}*\n\n👤 You: *{user_val}*\n🤖 Bot: *{bot_val}*\n\n"
-    
-    is_win = False
-    is_tie = False
-    
-    if user_val == bot_val:
-        is_tie = True
-    elif mode == "crazy":
-        if user_val < bot_val:
-            is_win = True
-    else:
-        if user_val > bot_val:
-            is_win = True
-            
-    if is_tie:
-        user_balances[user_id] += bet
-        update_user_stats(user_id, emoji, bet, 0.0, False)
-        res_text += f"🤝 *It's a Tie!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-    elif is_win:
-        win = bet * 1.94
-        profit_inr = win - bet
-        user_balances[user_id] += win
-        HOUSE_BALANCE -= profit_inr
-        update_user_stats(user_id, emoji, bet, profit_inr, True)
-        res_text += f"🎉 *You WON {format_money(win, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-    else:
-        profit_inr = -bet
-        HOUSE_BALANCE += bet
-        update_user_stats(user_id, emoji, bet, profit_inr, False)
-        res_text += f"😢 *You Lost!* Bot wins.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-        
-    send_message(chat_id, res_text)
-    if user_id in active_games:
-        del active_games[user_id]
-
-@app.route('/zapupi-webhook', methods=['POST'])
-def zapupi_webhook():
-    try:
-        data = request.get_json()
-        if not data: 
-            return jsonify({'status': 'error', 'message': 'No data'}), 400
-        
-        order_id = data.get('order_id')
-        status = data.get('status')
-        amount = float(data.get('amount', 0))
-        utr = data.get('utr', '')
-        
-        if status and status.lower() == 'success':
-            remark = data.get('remark', '')
-            chat_id = None
-            
-            if '|' in remark:
-                parts = remark.split('|')
-                for p in parts:
-                    if p.isdigit():
-                        chat_id = int(p)
-                        break
-            elif remark.isdigit():
-                chat_id = int(remark)
-                
-            if chat_id:
-                if chat_id not in user_balances: 
-                    user_balances[chat_id] = 0.0
-                    user_currency[chat_id] = 'INR'
-                user_balances[user_id] += amount
-                
-                if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
-                user_deposits[chat_id] += amount
-                
-                success_msg = f"✅ *Deposit Successful!* 🎉\n\nAdded: {format_money(amount, chat_id)}\nNew Balance: {format_money(user_balances[chat_id], chat_id)}\nOrder ID: `{order_id}`\nUTR: `{utr}`"
-                send_message(chat_id, success_msg)
-                    
-        return jsonify({'status': 'ok'}), 200
-    except Exception as e:
-        print(f"❌ ZapUPI Webhook Error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 200
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+                elif text.startswith('/tower '):
+                    parts = text.split(' ')
+                    bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+                    if not bet_inr or bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        send_message(chat_id, "⚠️ Invalid bet limits.")
+                    elif user_balances[user_id] < bet_inr:
+                        send_message(chat_id, "❌ Insufficient balance!")
+                    else:
+                        user_balances[user_id] -= bet_inr
+                        bot_win_chance = RIG_CONTROL["tower"]
+                        is_win = random.random() * 100 >= bot_win_chance
+                        
+                        climbed_levels = random.randint(3, 5) if is_win else random.randint(0, 2)
+                        multiplier = 1.5 * climbed_levels if climbed_levels > 0 else 0.0
+                        
+                        res_text = f"🏰 *Tower Climb Results
