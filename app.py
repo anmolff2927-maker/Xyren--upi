@@ -182,7 +182,6 @@ def telegram_webhook():
             chat_id = message['chat'].get('id')
             user_id = message['from'].get('id')
             
-            # New user gets 0 balance securely
             if user_id not in user_balances:
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
@@ -426,4 +425,5 @@ def telegram_webhook():
                         mode = "normal"
                         
                         if len(parts) > 1:
-                            if 
+                            if parts[1].lower() == 'crazy':
+                  
