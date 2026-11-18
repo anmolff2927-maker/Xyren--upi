@@ -13,10 +13,8 @@ ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# Tera Admin User ID
 ADMIN_USER_ID = 1822336097
 
-# Storage & Casino Settings
 user_balances = {}
 user_currency = {}
 user_stats = {}
@@ -30,7 +28,6 @@ MIN_BET = 10.0
 MAX_BET = 1000.0
 EXCHANGE_RATE = 98.0
 
-# Admin Win-Rate Rigging Controls (Bot Win Percentage)
 RIG_CONTROL = {
     "bj": 50.0,
     "tower": 50.0,
@@ -58,11 +55,7 @@ def parse_user_amount(text_val, user_id):
 
 def send_message(chat_id, text, reply_markup=None):
     url = f"{TELEGRAM_API_URL}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
@@ -348,7 +341,7 @@ def telegram_webhook():
                     else:
                         user_balances[user_id] -= bet_inr
                         bot_win_chance = RIG_CONTROL["bj"]
-                        is_win = random.random() * 100 >= bot_win_chance
+                        is_win = (random.random() * 100) >= bot_win_chance
                         
                         p_score = random.randint(18, 21) if is_win else random.randint(12, 17)
                         d_score = random.randint(12, 17) if is_win else random.randint(18, 21)
@@ -358,7 +351,7 @@ def telegram_webhook():
                         if p_score > 21 or (d_score <= 21 and d_score >= p_score):
                             is_win = False
                         else:
-                            is_win =
+                            is_win = True
                             
                         profit_inr = 0.0
                         if is_win:
@@ -393,7 +386,7 @@ def telegram_webhook():
                         else:
                             user_balances[user_id] -= bet_inr
                             bot_win_chance = RIG_CONTROL["limbo"]
-                            is_win = random.random() * 100 >= bot_win_chance
+                            is_win = (random.random() * 100) >= bot_win_chance
                             
                             landed = target_mult + round(random.uniform(0.1, 2.0), 2) if is_win else max(1.0, target_mult - round(random.uniform(0.1, 1.5), 2))
                             
@@ -426,7 +419,7 @@ def telegram_webhook():
                     else:
                         user_balances[user_id] -= bet_inr
                         bot_win_chance = RIG_CONTROL["tower"]
-                        is_win = random.random() * 100 >= bot_win_chance
+                        is_win = (random.random() * 100) >= bot_win_chance
                         
                         climbed_levels = random.randint(3, 5) if is_win else random.randint(0, 2)
                         multiplier = 1.5 * climbed_levels if climbed_levels > 0 else 0.0
@@ -458,7 +451,7 @@ def telegram_webhook():
                     else:
                         user_balances[user_id] -= bet_inr
                         bot_win_chance = RIG_CONTROL["mines"]
-                        is_win = random.random() * 100 >= bot_win_chance
+                        is_win = (random.random() * 100) >= bot_win_chance
                         
                         gems_found = random.randint(3, 6) if is_win else random.randint(0, 2)
                         mult = 1.2 * gems_found if gems_found > 0 else 0.0
