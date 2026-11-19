@@ -1371,6 +1371,24 @@ def telegram_webhook():
             if 'text' in message:
                 text = message['text'].strip()
 
+                if re.match(rf"^/setrate(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, f"💱 Current Rate: *₹{EXCHANGE_RATE:.2f} / USDT*\nUsage: `/setrate <rate>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        val = float(parts[1])
+                        if val <= 0:
+                            raise ValueError()
+                        EXCHANGE_RATE = val
+                        send_message(chat_id, f"✅ Exchange rate updated to *₹{EXCHANGE_RATE:.2f} / USDT*.")
+                    except ValueError:
+                        send_message(chat_id, "⚠️ Enter a valid positive rate (e.g. `/setrate 98`).")
+                    return jsonify({'status': 'ok'}), 200
+
                 if re.match(rf"^/sethb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
                         send_message(chat_id, "⛔ Unauthorized.")
