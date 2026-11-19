@@ -98,6 +98,348 @@ GAME_NAME_MAP = {
     "🎳": "Bowling",
 }
 
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def get_db_connection():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        balance DOUBLE PRECISION DEFAULT 0.0,
+                        currency TEXT DEFAULT 'INR',
+                        username TEXT,
+                        first_name TEXT,
+                        is_banned BOOLEAN DEFAULT FALSE,
+                        is_admin BOOLEAN DEFAULT FALSE,
+                        total_deposits DOUBLE PRECISION DEFAULT 0.0,
+                        total_withdrawals DOUBLE PRECISION DEFAULT 0.0,
+                        stats_json TEXT DEFAULT '{}'
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bet_logs (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        game_id TEXT,
+                        game_label TEXT,
+                        bet_inr DOUBLE PRECISION,
+                        pnl_inr DOUBLE PRECISION,
+                        outcome_label TEXT,
+                        created_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS deposits (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        amount DOUBLE PRECISION,
+                        utr TEXT,
+                        created_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS withdrawals (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        amount DOUBLE PRECISION,
+                        upi TEXT,
+                        created_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS approved_groups (
+                        chat_id BIGINT PRIMARY KEY
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_config (
+                        key TEXT PRIMARY KEY,
+                        value_json TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS game_records (
+                        game_id TEXT PRIMARY KEY,
+                        record_json TEXT
+                    )
+                """)
+    except Exception as e:
+        print(f"DB init error: {e}")
+    finally:
+        conn.close()
+
+def save_config_value(key, val):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_config (key, value_json) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value_json = EXCLUDED.value_json
+                    """,
+                    (key, json.dumps(val))
+                )
+    except Exception as e:
+        print(f"DB save_config error ({key}): {e}")
+    finally:
+        conn.close()
+
+def persist_config_all():
+    save_config_value("house_balance", HOUSE_BALANCE)
+    save_config_value("min_bet", MIN_BET)
+    save_config_value("max_bet", MAX_BET)
+    save_config_value("exchange_rate", EXCHANGE_RATE)
+    save_config_value("maintenance_mode", MAINTENANCE_MODE)
+    save_config_value("deposit_enabled", DEPOSIT_ENABLED)
+    save_config_value("withdraw_enabled", WITHDRAW_ENABLED)
+    save_config_value("game_multipliers", GAME_MULTIPLIERS)
+
+def persist_user(uid):
+    if uid is None:
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        bal = float(user_balances.get(uid, 0.0))
+        curr = user_currency.get(uid, "INR")
+        uname = user_usernames.get(uid)
+        fname = user_first_names.get(uid)
+        is_banned = uid in banned_users
+        is_adm = uid in admin_list
+        tot_dep = float(user_deposits.get(uid, 0.0))
+        tot_wd = float(user_withdrawals.get(uid, 0.0))
+        st_json = json.dumps(user_stats.get(uid, {"games": 0, "wins": 0, "losses": 0, "total_pnl": 0.0, "biggest_win": 0.0, "game_counts": {}}))
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (user_id, balance, currency, username, first_name, is_banned, is_admin, total_deposits, total_withdrawals, stats_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        balance = EXCLUDED.balance,
+                        currency = EXCLUDED.currency,
+                        username = COALESCE(EXCLUDED.username, users.username),
+                        first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                        is_banned = EXCLUDED.is_banned,
+                        is_admin = EXCLUDED.is_admin,
+                        total_deposits = EXCLUDED.total_deposits,
+                        total_withdrawals = EXCLUDED.total_withdrawals,
+                        stats_json = EXCLUDED.stats_json
+                    """,
+                    (uid, bal, curr, uname, fname, is_banned, is_adm, tot_dep, tot_wd, st_json)
+                )
+    except Exception as e:
+        print(f"DB persist_user error ({uid}): {e}")
+    finally:
+        conn.close()
+
+def persist_bet_log(user_id, game_label, bet_inr, pnl_inr, outcome_label, game_id, ts):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bet_logs (user_id, game_id, game_label, bet_inr, pnl_inr, outcome_label, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (user_id, game_id, game_label, float(bet_inr), float(pnl_inr), outcome_label, ts)
+                )
+    except Exception as e:
+        print(f"DB persist_bet_log error: {e}")
+    finally:
+        conn.close()
+
+def persist_deposit(user_id, amount, utr, ts):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO deposits (user_id, amount, utr, created_at) VALUES (%s, %s, %s, %s)",
+                    (user_id, float(amount), utr, ts)
+                )
+    except Exception as e:
+        print(f"DB persist_deposit error: {e}")
+    finally:
+        conn.close()
+
+def persist_withdrawal(user_id, amount, upi, ts):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO withdrawals (user_id, amount, upi, created_at) VALUES (%s, %s, %s, %s)",
+                    (user_id, float(amount), upi, ts)
+                )
+    except Exception as e:
+        print(f"DB persist_withdrawal error: {e}")
+    finally:
+        conn.close()
+
+def persist_approved_group(chat_id):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO approved_groups (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
+                    (chat_id,)
+                )
+    except Exception as e:
+        print(f"DB persist_approved_group error: {e}")
+    finally:
+        conn.close()
+
+def persist_game_record(game_id, record):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO game_records (game_id, record_json) VALUES (%s, %s)
+                    ON CONFLICT (game_id) DO UPDATE SET record_json = EXCLUDED.record_json
+                    """,
+                    (game_id, json.dumps(record))
+                )
+    except Exception as e:
+        print(f"DB persist_game_record error: {e}")
+    finally:
+        conn.close()
+
+def load_all_from_db():
+    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT key, value_json FROM bot_config")
+            for row in cur.fetchall():
+                k = row["key"]
+                v = json.loads(row["value_json"])
+                if k == "house_balance":
+                    HOUSE_BALANCE = float(v)
+                elif k == "min_bet":
+                    MIN_BET = float(v)
+                elif k == "max_bet":
+                    MAX_BET = float(v)
+                elif k == "exchange_rate":
+                    EXCHANGE_RATE = float(v)
+                elif k == "maintenance_mode":
+                    MAINTENANCE_MODE = bool(v)
+                elif k == "deposit_enabled":
+                    DEPOSIT_ENABLED = bool(v)
+                elif k == "withdraw_enabled":
+                    WITHDRAW_ENABLED = bool(v)
+                elif k == "game_multipliers" and isinstance(v, dict):
+                    for mk, mv in v.items():
+                        if mk == "dr_nums" and isinstance(mv, dict):
+                            GAME_MULTIPLIERS["dr_nums"].update({int(dk): float(dv) for dk, dv in mv.items()})
+                        else:
+                            GAME_MULTIPLIERS[mk] = float(mv)
+
+            cur.execute("SELECT * FROM users")
+            for r in cur.fetchall():
+                uid = int(r["user_id"])
+                user_balances[uid] = float(r["balance"] or 0.0)
+                user_currency[uid] = r["currency"] or "INR"
+                if r["username"]:
+                    clean_u = r["username"].lstrip("@").lower()
+                    user_usernames[uid] = clean_u
+                    username_to_id[clean_u] = uid
+                if r["first_name"]:
+                    user_first_names[uid] = r["first_name"]
+                if r["is_banned"]:
+                    banned_users.add(uid)
+                if r["is_admin"]:
+                    admin_list.add(uid)
+                user_deposits[uid] = float(r["total_deposits"] or 0.0)
+                user_withdrawals[uid] = float(r["total_withdrawals"] or 0.0)
+                if r["stats_json"]:
+                    try:
+                        parsed_st = json.loads(r["stats_json"])
+                        if isinstance(parsed_st, dict):
+                            user_stats[uid] = parsed_st
+                    except Exception:
+                        pass
+
+            cur.execute("SELECT * FROM bet_logs ORDER BY id ASC")
+            for r in cur.fetchall():
+                uid = int(r["user_id"])
+                user_bet_logs.setdefault(uid, []).append({
+                    "game_id": r["game_id"],
+                    "game": r["game_label"],
+                    "bet": float(r["bet_inr"] or 0.0),
+                    "pnl": float(r["pnl_inr"] or 0.0),
+                    "outcome": r["outcome_label"],
+                    "time": r["created_at"] or ""
+                })
+
+            cur.execute("SELECT * FROM deposits ORDER BY id ASC")
+            for r in cur.fetchall():
+                deposit_history.append({
+                    "user": int(r["user_id"]),
+                    "amount": float(r["amount"] or 0.0),
+                    "utr": r["utr"] or "",
+                    "time": r["created_at"] or ""
+                })
+
+            cur.execute("SELECT * FROM withdrawals ORDER BY id ASC")
+            for r in cur.fetchall():
+                withdrawal_history.append({
+                    "user": int(r["user_id"]),
+                    "amount": float(r["amount"] or 0.0),
+                    "upi": r["upi"] or "",
+                    "time": r["created_at"] or ""
+                })
+
+            cur.execute("SELECT chat_id FROM approved_groups")
+            for r in cur.fetchall():
+                approved_groups.add(int(r["chat_id"]))
+
+            cur.execute("SELECT game_id, record_json FROM game_records")
+            for r in cur.fetchall():
+                try:
+                    game_id_registry[r["game_id"]] = json.loads(r["record_json"])
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"DB load_all error: {e}")
+    finally:
+        conn.close()
+
+
 def fmt_mult(val):
     s = f"{float(val):.4f}".rstrip("0").rstrip(".")
     return f"{s}x"
@@ -162,6 +504,7 @@ def register_game_record(game_id, kind, owner_id, bet_inr, meta=None, refund_on_
         "meta": meta or {}
     }
     game_id_registry[game_id] = record
+    persist_game_record(game_id, record)
     return record
 
 def mark_game_finished(game_id, status="completed", extra_meta=None):
@@ -170,18 +513,22 @@ def mark_game_finished(game_id, status="completed", extra_meta=None):
         game_id_registry[game_id]["ended_at"] = current_timestamp()
         if extra_meta:
             game_id_registry[game_id]["meta"].update(extra_meta)
+        persist_game_record(game_id, game_id_registry[game_id])
 
 def record_user_bet(user_id, game_label, bet_inr, pnl_inr, outcome_label, game_id=None):
     if user_id not in user_bet_logs:
         user_bet_logs[user_id] = []
+    ts = current_timestamp()
     user_bet_logs[user_id].append({
         "game_id": game_id,
         "game": game_label,
         "bet": bet_inr,
         "pnl": pnl_inr,
         "outcome": outcome_label,
-        "time": current_timestamp()
+        "time": ts
     })
+    persist_bet_log(user_id, game_label, bet_inr, pnl_inr, outcome_label, game_id, ts)
+    persist_user(user_id)
 
 def resolve_user_identifier(raw_ident):
     if not raw_ident:
@@ -294,6 +641,7 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
     gid = game_id or generate_game_id()
     rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
     user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
+    persist_user(user_id)
     register_game_record(
         gid,
         "bot_versus",
@@ -392,6 +740,9 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
 
         win_pnl = payout - bet
         user_balances[winner_id] = user_balances.get(winner_id, 0.0) + payout
+        persist_user(winner_id)
+        persist_user(loser_id)
+        save_config_value("house_balance", HOUSE_BALANCE)
         update_user_stats(winner_id, emoji, bet, win_pnl, True)
         update_user_stats(loser_id, emoji, bet, -bet, False)
 
@@ -610,6 +961,7 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
             st["biggest_win"] = profit_inr
     else:
         st["losses"] += 1
+    persist_user(user_id)
 
 
 def format_history_money(amount_in_inr, user_id):
@@ -914,6 +1266,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
 
     if outcome == "push":
         user_balances[user_id] = user_balances.get(user_id, 0.0) + bet
+        persist_user(user_id)
         update_user_stats(user_id, "blackjack", bet, 0.0, False)
         record_user_bet(user_id, "Blackjack", bet, 0.0, "PUSH", game_id=gid)
         body = f"🤝 *Push (Tie)!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
@@ -922,6 +1275,8 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         profit_inr = win_amt - bet
         user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
         HOUSE_BALANCE -= profit_inr
+        persist_user(user_id)
+        save_config_value("house_balance", HOUSE_BALANCE)
         update_user_stats(user_id, "blackjack", bet, profit_inr, True)
         record_user_bet(user_id, "Blackjack", bet, profit_inr, "WON", game_id=gid)
         log_win_to_channel(user_id, "🃏", "Blackjack", win_amt, fmt_mult(mult))
@@ -1052,6 +1407,8 @@ def resolve_round_and_match(chat_id, user_id, game):
             profit_inr = win_amt - bet
             user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
             HOUSE_BALANCE -= profit_inr
+            persist_user(user_id)
+            save_config_value("house_balance", HOUSE_BALANCE)
             update_user_stats(user_id, emoji, bet, profit_inr, True)
             record_user_bet(user_id, label, bet, profit_inr, "WON", game_id=gid)
             mark_game_finished(
@@ -1176,6 +1533,7 @@ def telegram_webhook():
                             raise ValueError()
                         if t_user not in user_balances: user_balances[t_user] = 0.0
                         user_balances[t_user] += amt
+                        persist_user(t_user)
                         send_message(chat_id, f"✅ Added {format_money(amt, t_user)} to user `{t_user}`.")
                         send_message(t_user, f"💰 *Admin credited your account!* +{format_money(amt, t_user)}")
                     except:
@@ -1194,6 +1552,7 @@ def telegram_webhook():
                             raise ValueError()
                         if t_user in user_balances:
                             user_balances[t_user] = max(0.0, user_balances[t_user] - amt)
+                            persist_user(t_user)
                             send_message(chat_id, f"✅ Deducted {format_money(amt, t_user)} from user `{t_user}`.")
                             send_message(t_user, f"⚠️ *Admin deducted from your account.* -{format_money(amt, t_user)}")
                     except:
@@ -1219,6 +1578,7 @@ def telegram_webhook():
                         if target_u is None:
                             raise ValueError()
                         banned_users.add(target_u)
+                        persist_user(target_u)
                         send_message(chat_id, f"🚫 User `{target_u}` has been BANNED.")
                     except:
                         send_message(chat_id, "⚠️ Invalid User ID or Username.")
@@ -1231,6 +1591,7 @@ def telegram_webhook():
                         if target_u is None:
                             raise ValueError()
                         if target_u in banned_users: banned_users.remove(target_u)
+                        persist_user(target_u)
                         send_message(chat_id, f"✅ User `{target_u}` has been UNBANNED.")
                     except:
                         send_message(chat_id, "⚠️ Invalid User ID or Username.")
@@ -1243,6 +1604,7 @@ def telegram_webhook():
                         if target_u is None:
                             raise ValueError()
                         admin_list.add(target_u)
+                        persist_user(target_u)
                         send_message(chat_id, f"👑 User `{target_u}` granted Admin rights.")
                     except:
                         send_message(chat_id, "⚠️ Invalid User ID or Username.")
@@ -1455,6 +1817,7 @@ def telegram_webhook():
                         if val <= 0:
                             raise ValueError()
                         EXCHANGE_RATE = val
+                        save_config_value("exchange_rate", EXCHANGE_RATE)
                         send_message(chat_id, f"✅ Exchange rate updated to *₹{EXCHANGE_RATE:.2f} / USDT*.")
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid positive rate (e.g. `/setrate 98`).")
@@ -1473,6 +1836,7 @@ def telegram_webhook():
                         if val < 0:
                             raise ValueError()
                         HOUSE_BALANCE = val
+                        save_config_value("house_balance", HOUSE_BALANCE)
                         send_message(chat_id, f"✅ House Balance set to *{format_money(HOUSE_BALANCE, user_id)}*.")
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid non-negative amount (e.g. `/sethb 150000`).")
@@ -1491,6 +1855,7 @@ def telegram_webhook():
                         if amt <= 0:
                             raise ValueError()
                         HOUSE_BALANCE = max(0.0, HOUSE_BALANCE - amt)
+                        save_config_value("house_balance", HOUSE_BALANCE)
                         send_message(chat_id, f"✅ Deducted *{format_money(amt, user_id)}* from House Balance.\n🏦 New House Balance: *{format_money(HOUSE_BALANCE, user_id)}*")
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid positive amount (e.g. `/deducthb 5000`).")
@@ -2516,9 +2881,11 @@ def telegram_webhook():
                 
             if callback_data == "curr_inr":
                 user_currency[user_id] = 'INR'
+                persist_user(user_id)
                 send_message(chat_id, "✅ Currency successfully set to *INR (₹)*!")
             elif callback_data == "curr_usdt":
                 user_currency[user_id] = 'USDT'
+                persist_user(user_id)
                 send_message(chat_id, "✅ Currency successfully set to *USD ($)*!")
                 
             elif callback_data == "btn_deposit":
@@ -2624,12 +2991,15 @@ def telegram_webhook():
                     if user_id not in user_withdrawals: user_withdrawals[user_id] = 0.0
                     user_withdrawals[user_id] += raw_amt
                     
+                    ts_wd = current_timestamp()
                     withdrawal_history.append({
                         'user': user_id,
                         'amount': raw_amt,
                         'upi': st['upi_id'],
-                        'time': current_timestamp()
+                        'time': ts_wd
                     })
+                    persist_withdrawal(user_id, raw_amt, st['upi_id'], ts_wd)
+                    persist_user(user_id)
                     
                     amt_str = format_money(raw_amt, user_id)
                     upi_id = st['upi_id']
@@ -2744,12 +3114,15 @@ def zapupi_webhook():
                 if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
                 user_deposits[chat_id] += amount
                 
+                ts_dep = current_timestamp()
                 deposit_history.append({
                     'user': chat_id,
                     'amount': amount,
                     'utr': utr,
-                    'time': current_timestamp()
+                    'time': ts_dep
                 })
+                persist_deposit(chat_id, amount, utr, ts_dep)
+                persist_user(chat_id)
                 
                 success_msg = f"✅ *Deposit Successful!* 🎉\n\nAdded: {format_money(amount, chat_id)}\nNew Balance: {format_money(user_balances[chat_id], chat_id)}\nOrder ID: `{order_id}`\nUTR: `{utr}`"
                 send_message(chat_id, success_msg)
@@ -2758,6 +3131,10 @@ def zapupi_webhook():
     except Exception as e:
         print(f"❌ ZapUPI Webhook Error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 200
+
+
+init_db()
+load_all_from_db()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
