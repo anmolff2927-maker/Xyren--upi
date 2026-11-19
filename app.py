@@ -302,6 +302,27 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         meta={"chat_id": chat_id, "emoji": emoji, "mode": mode, "rw_label": rw_label},
         refund_on_cancel=True
     )
+    mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"}
+            ]
+        ]
+    }
+    text = (
+        f"🎮 *Game Started* (`{gid}` | {emoji} | `{rw_label}` | {mode_title})\n"
+        f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
+        f"💰 Bet: {format_money(bet_inr, user_id)}\n\nSend {emoji} x{rolls_per_round}"
+    )
+    sent_msg_id = message_id
+    if message_id:
+        edit_message(chat_id, message_id, text, reply_markup=keyboard)
+    else:
+        res = send_message(chat_id, text, reply_markup=keyboard)
+        if res and res.get("ok"):
+            sent_msg_id = res["result"]["message_id"]
+
     active_games[user_id] = {
         "game_id": gid,
         "bet": bet_inr,
@@ -316,26 +337,10 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         "current_user_rolls": [],
         "current_bot_rolls": [],
         "first_turn": None,
-        "step": "selecting_turn"
+        "step": "selecting_turn",
+        "start_chat_id": chat_id,
+        "start_message_id": sent_msg_id
     }
-    mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
-                {"text": "👤 You Roll First", "callback_data": "play_user_first"}
-            ]
-        ]
-    }
-    text = (
-        f"🎮 *Game Started* (`{gid}` | {emoji} | `{rw_label}` | {mode_title})\n"
-        f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
-        f"💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:"
-    )
-    if message_id:
-        edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    else:
-        send_message(chat_id, text, reply_markup=keyboard)
 
 def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     global HOUSE_BALANCE
@@ -1342,7 +1347,15 @@ def telegram_webhook():
                 game = active_ref
                 expected_emoji = game['emoji']
                 
-                if user_dice.get('emoji') == expected_emoji and game['step'] in ['waiting_user_first', 'waiting_user_second']:
+                if user_dice.get('emoji') == expected_emoji and game['step'] in ['selecting_turn', 'waiting_user_first', 'waiting_user_second']:
+                    if game['step'] == 'selecting_turn':
+                        game['first_turn'] = 'user'
+                        game['step'] = 'waiting_user_first'
+                        s_chat_id = game.get('start_chat_id') or chat_id
+                        s_msg_id = game.get('start_message_id')
+                        if s_msg_id:
+                            remove_inline_keyboard(s_chat_id, s_msg_id)
+                            game['start_message_id'] = None
                     user_val = user_dice.get('value', 1)
                     rolls_needed = game['rolls_per_round']
                     game['current_user_rolls'].append(user_val)
@@ -2589,32 +2602,30 @@ def telegram_webhook():
                 else:
                     send_message(chat_id, "⛔ Unauthorized.")
                 
-            elif callback_data in ["play_user_first", "play_bot_first"]:
+            elif callback_data == "play_bot_first":
                 remove_inline_keyboard(chat_id, message_id)
                 if user_id not in active_games or isinstance(active_games[user_id], str):
                     send_message(chat_id, "⚠️ Session expired. Start a new game.")
                     return jsonify({'status': 'ok'}), 200
                     
                 game = active_games[user_id]
+                if game.get("step") != "selecting_turn":
+                    return jsonify({'status': 'ok'}), 200
+                game["start_message_id"] = None
                 emoji = game["emoji"]
                 rolls_needed = game["rolls_per_round"]
                 game["current_user_rolls"] = []
                 game["current_bot_rolls"] = []
                 
-                if callback_data == "play_user_first":
-                    game["first_turn"] = "user"
-                    game["step"] = "waiting_user_first"
-                    send_message(chat_id, f"👤 You chose to roll first!\n\n👉 *Please send `{emoji}` x{rolls_needed} in chat now for Round {game['round_num']}!*")
-                else:
-                    game["first_turn"] = "bot"
-                    game["step"] = "waiting_user_second"
-                    send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first...")
-                    
-                    b_vals = roll_bot_series(chat_id, emoji, rolls_needed)
-                    game["current_bot_rolls"] = b_vals
-                    b_expr = "+".join(map(str, b_vals))
-                    
-                    send_message(chat_id, f"🤖 Bot Rolls: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now your turn! Please send `{emoji}` x{rolls_needed} in chat.*")
+                game["first_turn"] = "bot"
+                game["step"] = "waiting_user_second"
+                send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first...")
+                
+                b_vals = roll_bot_series(chat_id, emoji, rolls_needed)
+                game["current_bot_rolls"] = b_vals
+                b_expr = "+".join(map(str, b_vals))
+                
+                send_message(chat_id, f"🤖 Bot Rolls: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now your turn! Please send `{emoji}` x{rolls_needed} in chat.*")
                 
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
