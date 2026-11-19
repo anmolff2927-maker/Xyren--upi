@@ -4,6 +4,8 @@ import random
 import io
 import re
 import uuid
+import string
+from datetime import datetime
 import requests
 from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
@@ -28,6 +30,7 @@ username_to_id = {}
 user_stats = {}
 user_deposits = {}
 user_withdrawals = {}
+user_bet_logs = {}
 deposit_history = []
 withdrawal_history = []
 banned_users = set()
@@ -37,6 +40,7 @@ pending_game_setup = {}
 open_pvp_challenges = {}
 active_pvp_games = {}
 active_bj_games = {}
+game_id_registry = {}
 deposit_states = {}
 withdrawal_states = {}
 admin_states = {}
@@ -68,6 +72,57 @@ GAME_NAME_MAP = {
     "🏀": "Basketball",
     "🎳": "Bowling",
 }
+
+def current_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def generate_game_id():
+    while True:
+        mid = "".join(random.choices(string.ascii_uppercase + string.digits, k=7))
+        tail = "".join(random.choices(string.digits, k=4))
+        gid = f"XC-{mid}-{tail}"
+        if gid not in game_id_registry:
+            return gid
+
+def register_game_record(game_id, kind, owner_id, bet_inr, meta=None, refund_on_cancel=True):
+    record = {
+        "game_id": game_id,
+        "kind": kind,
+        "owner_id": owner_id,
+        "bet_inr": bet_inr,
+        "refund_on_cancel": refund_on_cancel,
+        "created_at": current_timestamp(),
+        "status": "active",
+        "meta": meta or {}
+    }
+    game_id_registry[game_id] = record
+    return record
+
+def mark_game_finished(game_id, status="completed"):
+    if game_id and game_id in game_id_registry:
+        game_id_registry[game_id]["status"] = status
+        game_id_registry[game_id]["ended_at"] = current_timestamp()
+
+def record_user_bet(user_id, game_label, bet_inr, pnl_inr, outcome_label, game_id=None):
+    if user_id not in user_bet_logs:
+        user_bet_logs[user_id] = []
+    user_bet_logs[user_id].append({
+        "game_id": game_id,
+        "game": game_label,
+        "bet": bet_inr,
+        "pnl": pnl_inr,
+        "outcome": outcome_label,
+        "time": current_timestamp()
+    })
+
+def resolve_user_identifier(raw_ident):
+    if not raw_ident:
+        return None
+    cleaned = raw_ident.strip()
+    if cleaned.lstrip("-").isdigit():
+        return int(cleaned)
+    uname = cleaned.lstrip("@").lower()
+    return username_to_id.get(uname)
 
 def register_user_identity(from_user):
     if not from_user:
@@ -150,11 +205,13 @@ def match_confirm_keyboard(chat_type="group"):
         ]
     }
 
-def build_match_confirmation_text(user_id, emoji, bet_inr, mode, rw_label):
+def build_match_confirmation_text(user_id, emoji, bet_inr, mode, rw_label, game_id=None):
     mode_label = "CRAZY (Lowest Sum Wins)" if mode == "crazy" else "NORMAL (Highest Sum Wins)"
     g_name = GAME_NAME_MAP.get(emoji, "Game")
+    gid_line = f"🆔 *Game ID:* `{game_id}`\n" if game_id else ""
     return (
         "📋 *Match Confirmation*\n\n"
+        f"{gid_line}"
         f"🎮 *Game:* {g_name} ({emoji})\n"
         f"⚙️ *Mode:* *{mode_label}*\n"
         f"🏆 *RW Format:* `{rw_label}`\n"
@@ -162,10 +219,20 @@ def build_match_confirmation_text(user_id, emoji, bet_inr, mode, rw_label):
         "Choose how you want to play:"
     )
 
-def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_label):
+def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_label, game_id=None):
+    gid = game_id or generate_game_id()
     rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
     user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
+    register_game_record(
+        gid,
+        "bot_versus",
+        user_id,
+        bet_inr,
+        meta={"chat_id": chat_id, "emoji": emoji, "mode": mode, "rw_label": rw_label},
+        refund_on_cancel=True
+    )
     active_games[user_id] = {
+        "game_id": gid,
         "bet": bet_inr,
         "emoji": emoji,
         "mode": mode,
@@ -190,7 +257,7 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         ]
     }
     text = (
-        f"🎮 *Game Started* ({emoji} | `{rw_label}` | {mode_title})\n"
+        f"🎮 *Game Started* (`{gid}` | {emoji} | `{rw_label}` | {mode_title})\n"
         f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
         f"💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:"
     )
@@ -201,7 +268,9 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
 
 def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     global HOUSE_BALANCE
+    gid = pvm.get("game_id") or match_id
     emoji = pvm["emoji"]
+    g_name = GAME_NAME_MAP.get(emoji, "Game")
     mode = pvm["mode"]
     rw_label = pvm["rw_label"]
     target_wins = pvm["target_wins"]
@@ -245,12 +314,18 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         house_fee = total_pot - payout
         HOUSE_BALANCE += house_fee
 
+        win_pnl = payout - bet
         user_balances[winner_id] = user_balances.get(winner_id, 0.0) + payout
-        update_user_stats(winner_id, emoji, bet, payout - bet, True)
+        update_user_stats(winner_id, emoji, bet, win_pnl, True)
         update_user_stats(loser_id, emoji, bet, -bet, False)
 
+        label = f"PvP {g_name} ({rw_label}/{mode})"
+        record_user_bet(winner_id, label, bet, win_pnl, "WON", game_id=gid)
+        record_user_bet(loser_id, label, bet, -bet, "LOST", game_id=gid)
+        mark_game_finished(gid, "completed")
+
         final_text = (
-            f"🏁 *Final Round {round_num}* ({emoji} | `{rw_label}` | {mode_tag})\n"
+            f"🏁 *Final Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
             f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
             f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n\n"
             f"🌟 *Match Won by `{winner_id}`!* 🌟\n"
@@ -266,7 +341,7 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         return
 
     msg = (
-        f"⚔️ *Round {round_num}* ({emoji} | `{rw_label}` | {mode_tag})\n"
+        f"⚔️ *Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
         f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
         f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n"
         f"{r_status}\n"
@@ -458,8 +533,117 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
     else:
         st["losses"] += 1
 
+def build_user_info_report(target_uid):
+    bal_str = format_money(user_balances.get(target_uid, 0.0), target_uid)
+    curr = user_currency.get(target_uid, "INR")
+    uname = user_usernames.get(target_uid)
+    uname_str = f"@{uname}" if uname else "N/A"
+    status_str = "🔴 BANNED" if target_uid in banned_users else "🟢 Active"
+
+    dep_total = format_money(user_deposits.get(target_uid, 0.0), target_uid)
+    wd_total = format_money(user_withdrawals.get(target_uid, 0.0), target_uid)
+
+    u_deps = [d for d in deposit_history if d.get("user") == target_uid]
+    u_wds = [w for w in withdrawal_history if w.get("user") == target_uid]
+    u_bets = user_bet_logs.get(target_uid, [])
+
+    lines = [
+        "🪪 *User Full Info*",
+        f"• *User ID:* `{target_uid}`",
+        f"• *Username:* {uname_str}",
+        f"• *Status:* {status_str}",
+        f"• *Currency:* *{curr}*",
+        f"• *Current Balance:* *{bal_str}*",
+        f"• *Total Deposited:* *{dep_total}* (`{len(u_deps)}` txns)",
+        f"• *Total Withdrawn:* *{wd_total}* (`{len(u_wds)}` txns)",
+        f"• *Total Bets Logged:* *{len(u_bets)}*",
+        "",
+        "📥 *Recent Deposits:*"
+    ]
+    if u_deps:
+        for d in u_deps[-8:]:
+            t_str = d.get("time", "N/A")
+            utr_str = d.get("utr") or "N/A"
+            lines.append(f"  - `{t_str}` | *{format_money(d['amount'], target_uid)}* | UTR: `{utr_str}`")
+    else:
+        lines.append("  - No deposits found.")
+
+    lines.append("")
+    lines.append("📤 *Recent Withdrawals:*")
+    if u_wds:
+        for w in u_wds[-8:]:
+            t_str = w.get("time", "N/A")
+            upi_str = w.get("upi") or "N/A"
+            lines.append(f"  - `{t_str}` | *{format_money(w['amount'], target_uid)}* | UPI: `{upi_str}`")
+    else:
+        lines.append("  - No withdrawals found.")
+
+    lines.append("")
+    lines.append("🎲 *Recent Bets:*")
+    if u_bets:
+        for b in u_bets[-10:]:
+            gid_part = f"`{b['game_id']}` | " if b.get("game_id") else ""
+            pnl_val = b.get("pnl", 0.0)
+            sign = "+" if pnl_val > 0 else ""
+            pnl_str = f"{sign}{format_money(pnl_val, target_uid)}"
+            lines.append(
+                f"  - {gid_part}*{b['game']}* | Bet: *{format_money(b['bet'], target_uid)}* | "
+                f"*{b['outcome']}* ({pnl_str}) | `{b.get('time', '')}`"
+            )
+    else:
+        lines.append("  - No bets recorded yet.")
+
+    return "\n".join(lines)
+
+def cancel_game_by_id(target_gid):
+    gid = target_gid.strip().upper()
+    rec = game_id_registry.get(gid)
+    if not rec:
+        return False, f"⚠️ Game ID `{gid}` not found."
+
+    if rec.get("status") != "active":
+        return False, f"⚠️ Game `{gid}` is already *{rec.get('status')}*."
+
+    kind = rec.get("kind")
+    owner_id = rec.get("owner_id")
+    bet_inr = rec.get("bet_inr", 0.0)
+    refund = rec.get("refund_on_cancel", True)
+
+    if kind == "bot_versus":
+        active_games.pop(owner_id, None)
+        if refund and bet_inr > 0:
+            user_balances[owner_id] = user_balances.get(owner_id, 0.0) + bet_inr
+    elif kind == "pvp_match":
+        match_id = rec.get("meta", {}).get("match_id")
+        p1 = rec.get("meta", {}).get("p1_id")
+        p2 = rec.get("meta", {}).get("p2_id")
+        if match_id:
+            active_pvp_games.pop(match_id, None)
+        if p1 and active_games.get(p1) == match_id:
+            active_games.pop(p1, None)
+        if p2 and active_games.get(p2) == match_id:
+            active_games.pop(p2, None)
+        if refund and bet_inr > 0:
+            if p1 is not None:
+                user_balances[p1] = user_balances.get(p1, 0.0) + bet_inr
+            if p2 is not None:
+                user_balances[p2] = user_balances.get(p2, 0.0) + bet_inr
+    elif kind == "blackjack":
+        bj = active_bj_games.pop(owner_id, None)
+        effective_bet = (bj or {}).get("bet", bet_inr)
+        if refund and effective_bet > 0:
+            user_balances[owner_id] = user_balances.get(owner_id, 0.0) + effective_bet
+    elif kind == "prediction":
+        if refund and bet_inr > 0:
+            user_balances[owner_id] = user_balances.get(owner_id, 0.0) + bet_inr
+
+    mark_game_finished(gid, "cancelled")
+    refund_note = " Stake refunded." if refund and bet_inr > 0 else ""
+    return True, f"🛑 Game `{gid}` has been *CANCELLED*.{refund_note}"
+
 def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
     global HOUSE_BALANCE
+    gid = bj.get("game_id")
     p_cards = bj["player_cards"]
     d_cards = bj["dealer_cards"]
     p_tot = calculate_hand_total(p_cards)
@@ -467,7 +651,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
     bet = bj["bet"]
 
     header = (
-        f"🃏 *Blackjack Result*\n\n"
+        f"🃏 *Blackjack Result* (`{gid}`)\n\n"
         f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
         f"🤖 Dealer Hand: {format_cards(d_cards)} (*{d_tot}*)\n"
         f"💰 Total Bet: {format_money(bet, user_id)}\n\n"
@@ -476,6 +660,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
     if outcome == "push":
         user_balances[user_id] = user_balances.get(user_id, 0.0) + bet
         update_user_stats(user_id, "blackjack", bet, 0.0, False)
+        record_user_bet(user_id, "Blackjack", bet, 0.0, "PUSH", game_id=gid)
         body = f"🤝 *Push (Tie)!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
     elif outcome == "win":
         win_amt = bet * 1.94
@@ -483,14 +668,17 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
         HOUSE_BALANCE -= profit_inr
         update_user_stats(user_id, "blackjack", bet, profit_inr, True)
+        record_user_bet(user_id, "Blackjack", bet, profit_inr, "WON", game_id=gid)
         body = f"🎉 *You WON {format_money(win_amt, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
     else:
         profit_inr = -bet
         HOUSE_BALANCE += bet
         update_user_stats(user_id, "blackjack", bet, profit_inr, False)
+        record_user_bet(user_id, "Blackjack", bet, profit_inr, "LOST", game_id=gid)
         reason_txt = "Bust! Over 21." if outcome == "bust" else "Dealer wins."
         body = f"😢 *You Lost!* {reason_txt}\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
 
+    mark_game_finished(gid, "completed")
     edit_message(chat_id, message_id, header + body, reply_markup=None)
     if user_id in active_bj_games:
         del active_bj_games[user_id]
@@ -563,7 +751,9 @@ def create_zapupi_order(amount, chat_id):
 
 def resolve_round_and_match(chat_id, user_id, game):
     global HOUSE_BALANCE
+    gid = game.get("game_id")
     emoji = game["emoji"]
+    g_name = GAME_NAME_MAP.get(emoji, "Game")
     mode = game["mode"]
     rw_label = game["rw_label"]
     target_wins = game["target_wins"]
@@ -599,14 +789,16 @@ def resolve_round_and_match(chat_id, user_id, game):
 
     if game["user_wins"] >= target_wins or game["bot_wins"] >= target_wins:
         user_won_match = game["user_wins"] >= target_wins
+        label = f"Bot {g_name} ({rw_label}/{mode})"
         if user_won_match:
             win_amt = bet * 1.94
             profit_inr = win_amt - bet
             user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
             HOUSE_BALANCE -= profit_inr
             update_user_stats(user_id, emoji, bet, profit_inr, True)
+            record_user_bet(user_id, label, bet, profit_inr, "WON", game_id=gid)
             final_text = (
-                f"🏁 *Final Round {round_num}* (`{rw_label}` | {mode_tag})\n"
+                f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
                 f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
                 f"🎉 *Congratulations! You won the match!* ✨\n"
@@ -616,20 +808,22 @@ def resolve_round_and_match(chat_id, user_id, game):
             profit_inr = -bet
             HOUSE_BALANCE += bet
             update_user_stats(user_id, emoji, bet, profit_inr, False)
+            record_user_bet(user_id, label, bet, profit_inr, "LOST", game_id=gid)
             final_text = (
-                f"🏁 *Final Round {round_num}* (`{rw_label}` | {mode_tag})\n"
+                f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
                 f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
                 f"💫 *Well played, but the bot got the better of you this time!* Better luck next round."
             )
 
+        mark_game_finished(gid, "completed")
         send_message(chat_id, final_text)
         if user_id in active_games:
             del active_games[user_id]
         return
 
     msg = (
-        f"⚔️ *Round {round_num}* (`{rw_label}` | {mode_tag})\n"
+        f"⚔️ *Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
         f"👤 You: `{u_expr}` = *{u_sum}*\n"
         f"🤖 Bot: `{b_expr}` = *{b_sum}*\n"
         f"{r_status}\n"
@@ -956,6 +1150,39 @@ def telegram_webhook():
                         send_message(chat_id, "⛔ Unauthorized.")
                     return jsonify({'status': 'ok'}), 200
 
+                if re.match(rf"^/info(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized. `/info` is restricted to admins.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, "⚠️ Usage: `/info <username/userid>`")
+                        return jsonify({'status': 'ok'}), 200
+                    target_uid = resolve_user_identifier(parts[1])
+                    if target_uid is None:
+                        send_message(chat_id, f"⚠️ User `{parts[1]}` not found.")
+                        return jsonify({'status': 'ok'}), 200
+                    send_message(chat_id, build_user_info_report(target_uid))
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/cancel(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, "⚠️ Usage: `/cancel XC-XXXXXXX-XXXX`")
+                        return jsonify({'status': 'ok'}), 200
+                    gid = parts[1].strip().upper()
+                    rec = game_id_registry.get(gid)
+                    if not rec:
+                        send_message(chat_id, f"⚠️ Game ID `{gid}` not found.")
+                        return jsonify({'status': 'ok'}), 200
+                    involved = {rec.get("owner_id"), rec.get("meta", {}).get("p1_id"), rec.get("meta", {}).get("p2_id")}
+                    if user_id not in admin_list and user_id not in involved:
+                        send_message(chat_id, "⛔ You can only cancel your own active games.")
+                        return jsonify({'status': 'ok'}), 200
+                    _, status_msg = cancel_game_by_id(gid)
+                    send_message(chat_id, status_msg)
+                    return jsonify({'status': 'ok'}), 200
+
                 if re.match(rf"^/tip(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     parts = text.split()
                     current_bal = user_balances.get(user_id, 0.0)
@@ -1025,7 +1252,8 @@ def telegram_webhook():
                         "- `/stats` - View your visual stats card\n"
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n"
-                        "- `/tip <amount> <username>` or reply `/tip <amount>` - Send tip\n\n"
+                        "- `/tip <amount> <username>` or reply `/tip <amount>` - Send tip\n"
+                        "- `/cancel <game_id>` - Cancel an active game\n\n"
                         "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "• `/dice 50` → Opens menu\n"
@@ -1058,14 +1286,16 @@ def telegram_webhook():
                             f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                         )
                     else:
+                        gid = generate_game_id()
                         user_balances[user_id] = current_bal - bet_inr
+                        register_game_record(gid, "blackjack", user_id, bet_inr, meta={"chat_id": chat_id}, refund_on_cancel=True)
                         p_cards = [draw_card(), draw_card()]
                         d_cards = [draw_card(), draw_card()]
                         p_tot = calculate_hand_total(p_cards)
 
                         can_double = user_balances.get(user_id, 0.0) >= bet_inr
                         table_msg = (
-                            f"🃏 *Blackjack Started!*\n\n"
+                            f"🃏 *Blackjack Started!* (`{gid}`)\n\n"
                             f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
                             f"🤖 Dealer Shows: `{d_cards[0]}` `[?]`\n"
                             f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
@@ -1075,6 +1305,7 @@ def telegram_webhook():
                         msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
 
                         active_bj_games[user_id] = {
+                            "game_id": gid,
                             "chat_id": chat_id,
                             "message_id": msg_id,
                             "bet": bet_inr,
@@ -1215,8 +1446,10 @@ def telegram_webhook():
                         win_desc = ""
                         
                         if arg in ['high', 'low', 'odd', 'even']:
+                            gid = generate_game_id()
                             user_balances[user_id] = current_bal - bet_inr
-                            send_message(chat_id, f"🎲 Rolling dice for Prediction (*{arg.upper()}* | Bet: {format_money(bet_inr, user_id)})...")
+                            register_game_record(gid, "prediction", user_id, bet_inr, meta={"choice": arg}, refund_on_cancel=True)
+                            send_message(chat_id, f"🎲 Rolling dice for Prediction (`{gid}` | *{arg.upper()}* | Bet: {format_money(bet_inr, user_id)})...")
                             
                             res = send_animated_game(chat_id, '🎲')
                             dice_val = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
@@ -1235,8 +1468,10 @@ def telegram_webhook():
                                 if not all(1 <= n <= 6 for n in nums) or len(nums) > 5 or len(nums) != len(set(nums)):
                                     raise ValueError()
                                     
+                                gid = generate_game_id()
                                 user_balances[user_id] = current_bal - bet_inr
-                                send_message(chat_id, f"🎲 Rolling dice for Numbers (*{nums}* | Bet: {format_money(bet_inr, user_id)})...")
+                                register_game_record(gid, "prediction", user_id, bet_inr, meta={"nums": nums}, refund_on_cancel=True)
+                                send_message(chat_id, f"🎲 Rolling dice for Numbers (`{gid}` | *{nums}* | Bet: {format_money(bet_inr, user_id)})...")
                                 
                                 res = send_animated_game(chat_id, '🎲')
                                 dice_val = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
@@ -1252,20 +1487,23 @@ def telegram_webhook():
                                 send_message(chat_id, "⚠️ Invalid format! Use `high`, `low`, `odd`, `even` or numbers like `2,4,6`.\nExample: `/dr 50 2,4,6`")
                                 return jsonify({'status': 'ok'}), 200
                                 
-                        result_text = f"📊 *Dice Prediction Result*\n\n🎲 Rolled Number: *{dice_val}*\n🎯 {win_desc}\n\n"
+                        result_text = f"📊 *Dice Prediction Result* (`{gid}`)\n\n🎲 Rolled Number: *{dice_val}*\n🎯 {win_desc}\n\n"
                         if is_win:
                             win_amt = bet_inr * multiplier
                             profit_inr = win_amt - bet_inr
                             user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
                             HOUSE_BALANCE -= profit_inr
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, True)
+                            record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "WON", game_id=gid)
                             result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{multiplier}x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                         else:
                             profit_inr = -bet_inr
                             HOUSE_BALANCE += bet_inr
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, False)
+                            record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "LOST", game_id=gid)
                             result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                             
+                        mark_game_finished(gid, "completed")
                         send_message(chat_id, result_text)
                     else:
                         send_message(chat_id, "⚠️ Format error! Use: `/dr <amount> <choice>`\nExample: `/dr 50 high` or `/dr 50 1,3,5`")
@@ -1322,12 +1560,14 @@ def telegram_webhook():
                                 f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                             )
                         else:
+                            gid = generate_game_id()
                             g_name = GAME_NAME_MAP.get(triggered_game, "Game")
                             if rw_label is not None and mode is not None:
-                                conf_msg = build_match_confirmation_text(user_id, triggered_game, bet_inr, mode, rw_label)
+                                conf_msg = build_match_confirmation_text(user_id, triggered_game, bet_inr, mode, rw_label, game_id=gid)
                                 sent = send_message(chat_id, conf_msg, reply_markup=match_confirm_keyboard(chat_type))
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
                                 pending_game_setup[user_id] = {
+                                    "game_id": gid,
                                     "chat_id": chat_id,
                                     "chat_type": chat_type,
                                     "message_id": msg_id,
@@ -1338,13 +1578,14 @@ def telegram_webhook():
                                 }
                             elif mode is None:
                                 setup_msg = (
-                                    f"🎮 *{g_name} ({triggered_game}) Setup*\n"
+                                    f"🎮 *{g_name} ({triggered_game}) Setup* (`{gid}`)\n"
                                     f"💰 Bet: *{format_money(bet_inr, user_id)}*\n\n"
                                     "Select Mode:"
                                 )
                                 sent = send_message(chat_id, setup_msg, reply_markup=game_style_keyboard())
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
                                 pending_game_setup[user_id] = {
+                                    "game_id": gid,
                                     "chat_id": chat_id,
                                     "chat_type": chat_type,
                                     "message_id": msg_id,
@@ -1356,12 +1597,13 @@ def telegram_webhook():
                             else:
                                 mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
                                 rw_msg = (
-                                    f"🎯 *Select RW Mode* ({g_name} {triggered_game} | {mode_title})\n"
+                                    f"🎯 *Select RW Mode* (`{gid}` | {g_name} {triggered_game} | {mode_title})\n"
                                     f"💰 Bet: *{format_money(bet_inr, user_id)}*\n\nTap a mode below:"
                                 )
                                 sent = send_message(chat_id, rw_msg, reply_markup=rw_mode_keyboard())
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
                                 pending_game_setup[user_id] = {
+                                    "game_id": gid,
                                     "chat_id": chat_id,
                                     "chat_type": chat_type,
                                     "message_id": msg_id,
@@ -1389,10 +1631,14 @@ def telegram_webhook():
 
             if callback_data == "gs_cancel":
                 setup = pending_game_setup.pop(user_id, None)
+                if setup and setup.get("game_id") in game_id_registry:
+                    mark_game_finished(setup["game_id"], "cancelled")
                 target_chat = (setup or {}).get("chat_id") or chat_id
                 target_msg = (setup or {}).get("message_id") or message_id
                 for cid, ch in list(open_pvp_challenges.items()):
                     if ch["host_id"] == user_id:
+                        if ch.get("game_id"):
+                            mark_game_finished(ch["game_id"], "cancelled")
                         open_pvp_challenges.pop(cid, None)
                 edit_message(target_chat, target_msg, "❌ Game cancelled.")
                 return jsonify({'status': 'ok'}), 200
@@ -1410,6 +1656,7 @@ def telegram_webhook():
                 setup["message_id"] = target_msg
                 bet_inr = setup["bet"]
                 emoji = setup["emoji"]
+                gid = setup.get("game_id")
                 current_bal = user_balances.get(user_id, 0.0)
 
                 if setup.get("rw_label") in VALID_RW_MODES:
@@ -1424,14 +1671,14 @@ def telegram_webhook():
                             f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                         )
                     else:
-                        conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, chosen_mode, setup["rw_label"])
+                        conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, chosen_mode, setup["rw_label"], game_id=gid)
                         edit_message(target_chat, target_msg, conf_msg, reply_markup=match_confirm_keyboard(target_chat_type))
                     return jsonify({'status': 'ok'}), 200
 
                 g_name = GAME_NAME_MAP.get(emoji, "Game")
                 mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if chosen_mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
                 rw_msg = (
-                    f"🎯 *Select RW Mode* ({g_name} {emoji} | {mode_title})\n"
+                    f"🎯 *Select RW Mode* (`{gid}` | {g_name} {emoji} | {mode_title})\n"
                     f"💰 Bet: *{format_money(bet_inr, user_id)}*\n\nTap a mode below:"
                 )
                 edit_message(target_chat, target_msg, rw_msg, reply_markup=rw_mode_keyboard())
@@ -1453,6 +1700,7 @@ def telegram_webhook():
                 setup["mode"] = mode
                 setup["rw_label"] = chosen_rw
                 emoji = setup["emoji"]
+                gid = setup.get("game_id")
                 current_bal = user_balances.get(user_id, 0.0)
 
                 if bet_inr < MIN_BET or bet_inr > MAX_BET:
@@ -1466,7 +1714,7 @@ def telegram_webhook():
                         f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                     )
                 else:
-                    conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, mode, chosen_rw)
+                    conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, mode, chosen_rw, game_id=gid)
                     edit_message(target_chat, target_msg, conf_msg, reply_markup=match_confirm_keyboard(target_chat_type))
                 return jsonify({'status': 'ok'}), 200
 
@@ -1478,6 +1726,7 @@ def telegram_webhook():
                 target_chat = conf.get("chat_id") or chat_id
                 target_msg = conf.get("message_id") or message_id
                 bet_inr = conf["bet"]
+                gid = conf.get("game_id") or generate_game_id()
                 current_bal = user_balances.get(user_id, 0.0)
                 if bet_inr < MIN_BET or bet_inr > MAX_BET:
                     edit_message(target_chat, target_msg, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
@@ -1488,7 +1737,7 @@ def telegram_webhook():
                         f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                     )
                 else:
-                    start_versus_match(target_chat, target_msg, user_id, conf["emoji"], bet_inr, conf["mode"] or "normal", conf["rw_label"])
+                    start_versus_match(target_chat, target_msg, user_id, conf["emoji"], bet_inr, conf["mode"] or "normal", conf["rw_label"], game_id=gid)
                 return jsonify({'status': 'ok'}), 200
 
             if callback_data == "mc_player":
@@ -1518,6 +1767,7 @@ def telegram_webhook():
                     return jsonify({'status': 'ok'}), 200
 
                 challenge_id = uuid.uuid4().hex[:8]
+                gid = conf.get("game_id") or generate_game_id()
                 mode = conf["mode"] or "normal"
                 rw_label = conf["rw_label"] or "1r1w"
                 rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
@@ -1525,6 +1775,7 @@ def telegram_webhook():
                 g_name = GAME_NAME_MAP.get(conf["emoji"], "Game")
 
                 open_pvp_challenges[challenge_id] = {
+                    "game_id": gid,
                     "chat_id": target_chat,
                     "message_id": target_msg,
                     "host_id": user_id,
@@ -1537,6 +1788,7 @@ def telegram_webhook():
                 }
                 invite_msg = (
                     "⚔️ *Player vs Player Challenge!*\n\n"
+                    f"🆔 *Game ID:* `{gid}`\n"
                     f"👤 *Challenger:* `{user_id}`\n"
                     f"🎮 *Game:* {g_name} ({conf['emoji']})\n"
                     f"⚙️ *Mode:* *{mode_label}*\n"
@@ -1564,6 +1816,8 @@ def telegram_webhook():
                 if user_id != ch["host_id"] and user_id not in admin_list:
                     answer_callback(callback_query_id, "Only challenger can cancel!")
                     return jsonify({'status': 'ok'}), 200
+                if ch.get("game_id"):
+                    mark_game_finished(ch["game_id"], "cancelled")
                 open_pvp_challenges.pop(cid, None)
                 edit_message(ch.get("chat_id") or chat_id, ch.get("message_id") or message_id, f"❌ PvP Challenge `{cid}` cancelled.")
                 return jsonify({'status': 'ok'}), 200
@@ -1585,6 +1839,8 @@ def telegram_webhook():
                 target_msg = ch.get("message_id") or message_id
 
                 if user_balances.get(host_id, 0.0) < bet_inr:
+                    if ch.get("game_id"):
+                        mark_game_finished(ch["game_id"], "cancelled")
                     open_pvp_challenges.pop(cid, None)
                     edit_message(target_chat, target_msg, "❌ Challenger has insufficient balance. Challenge cancelled.")
                     return jsonify({'status': 'ok'}), 200
@@ -1597,8 +1853,18 @@ def telegram_webhook():
                 user_balances[host_id] = user_balances.get(host_id, 0.0) - bet_inr
                 user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
 
+                gid = ch.get("game_id") or generate_game_id()
                 match_id = f"pvp_{cid}"
+                register_game_record(
+                    gid,
+                    "pvp_match",
+                    host_id,
+                    bet_inr,
+                    meta={"match_id": match_id, "p1_id": host_id, "p2_id": user_id},
+                    refund_on_cancel=True
+                )
                 active_pvp_games[match_id] = {
+                    "game_id": gid,
                     "chat_id": target_chat,
                     "p1_id": host_id,
                     "p2_id": user_id,
@@ -1619,7 +1885,7 @@ def telegram_webhook():
                 active_games[user_id] = match_id
 
                 start_text = (
-                    f"🎮 *PvP Match Started!* ({ch['emoji']} | `{ch['rw_label']}`)\n"
+                    f"🎮 *PvP Match Started!* (`{gid}` | {ch['emoji']} | `{ch['rw_label']}`)\n"
                     f"👤 P1: `{host_id}` vs P2: `{user_id}` | Bet: *{format_money(bet_inr, user_id)}*\n"
                     f"🎯 First to *{ch['target_wins']}* round win(s) | *{ch['rolls_per_round']}* roll(s)/round\n\n"
                     f"👉 *Round 1 — Player 1 (`{host_id}`), send `{ch['emoji']}` x{ch['rolls_per_round']} in chat!*"
@@ -1645,7 +1911,7 @@ def telegram_webhook():
                         play_dealer_and_settle(target_chat, target_msg, user_id, bj)
                     else:
                         msg = (
-                            f"🃏 *Blackjack (Hit)*\n\n"
+                            f"🃏 *Blackjack (Hit)* (`{bj.get('game_id')}`)\n\n"
                             f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
                             f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
                             f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
@@ -1661,7 +1927,7 @@ def telegram_webhook():
                     if user_balances.get(user_id, 0.0) < extra_bet:
                         p_tot = calculate_hand_total(bj["player_cards"])
                         msg = (
-                            f"🃏 *Blackjack*\n\n"
+                            f"🃏 *Blackjack* (`{bj.get('game_id')}`)\n\n"
                             f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
                             f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
                             f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
@@ -1741,13 +2007,15 @@ def telegram_webhook():
                 elif callback_data == "adm_last_dep":
                     txt = "📥 *Last 50 Deposits:*\n"
                     for d in deposit_history[-50:]:
-                        txt += f"- User `{d['user']}`: {format_money(d['amount'], d['user'])} (UTR: `{d['utr']}`)\n"
+                        t_str = f" [{d['time']}]" if d.get("time") else ""
+                        txt += f"- User `{d['user']}`: {format_money(d['amount'], d['user'])} (UTR: `{d['utr']}`){t_str}\n"
                     if not deposit_history: txt += "No deposits recorded yet."
                     send_message(chat_id, txt)
                 elif callback_data == "adm_last_wd":
                     txt = "📤 *Last 50 Withdrawals:*\n"
                     for w in withdrawal_history[-50:]:
-                        txt += f"- User `{w['user']}`: {format_money(w['amount'], w['user'])} to `{w['upi']}`\n"
+                        t_str = f" [{w['time']}]" if w.get("time") else ""
+                        txt += f"- User `{w['user']}`: {format_money(w['amount'], w['user'])} to `{w['upi']}`{t_str}\n"
                     if not withdrawal_history: txt += "No withdrawals recorded yet."
                     send_message(chat_id, txt)
                 elif callback_data == "adm_grant":
@@ -1791,7 +2059,12 @@ def telegram_webhook():
                     if user_id not in user_withdrawals: user_withdrawals[user_id] = 0.0
                     user_withdrawals[user_id] += raw_amt
                     
-                    withdrawal_history.append({'user': user_id, 'amount': raw_amt, 'upi': st['upi_id']})
+                    withdrawal_history.append({
+                        'user': user_id,
+                        'amount': raw_amt,
+                        'upi': st['upi_id'],
+                        'time': current_timestamp()
+                    })
                     
                     amt_str = format_money(raw_amt, user_id)
                     upi_id = st['upi_id']
@@ -1908,7 +2181,12 @@ def zapupi_webhook():
                 if chat_id not in user_deposits: user_deposits[chat_id] = 0.0
                 user_deposits[chat_id] += amount
                 
-                deposit_history.append({'user': chat_id, 'amount': amount, 'utr': utr})
+                deposit_history.append({
+                    'user': chat_id,
+                    'amount': amount,
+                    'utr': utr,
+                    'time': current_timestamp()
+                })
                 
                 success_msg = f"✅ *Deposit Successful!* 🎉\n\nAdded: {format_money(amount, chat_id)}\nNew Balance: {format_money(user_balances[chat_id], chat_id)}\nOrder ID: `{order_id}`\nUTR: `{utr}`"
                 send_message(chat_id, success_msg)
