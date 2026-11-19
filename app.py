@@ -1188,10 +1188,8 @@ def telegram_webhook():
                         
                         for tok in tokens:
                             low_tok = tok.lower()
-                            if low_tok == "crazy":
-                                mode = "crazy"
-                            elif low_tok == "normal":
-                                mode = "normal"
+                            if low_tok in ["crazy", "normal"]:
+                                mode = low_tok
                             elif re.fullmatch(r"\d+r\d+w", low_tok):
                                 if low_tok in VALID_RW_MODES:
                                     rw_label = low_tok
@@ -1226,7 +1224,7 @@ def telegram_webhook():
                                     "emoji": triggered_game,
                                     "bet": bet_inr,
                                     "mode": None,
-                                    "rw_label": rw_label
+                                    "rw_label": None
                                 }
                             elif rw_label is None:
                                 mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
@@ -1295,12 +1293,14 @@ def telegram_webhook():
                 target_chat = setup.get("chat_id") or chat_id
                 target_msg = setup.get("message_id") or message_id
                 setup["message_id"] = target_msg
+                bet_inr = setup["bet"]
+                emoji = setup["emoji"]
 
-                g_name = GAME_NAME_MAP.get(setup["emoji"], "Game")
+                g_name = GAME_NAME_MAP.get(emoji, "Game")
                 mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if chosen_mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
                 rw_msg = (
-                    f"🎯 *Select RW Mode* ({g_name} {setup['emoji']} | {mode_title})\n"
-                    f"💰 Bet: *{format_money(setup['bet'], user_id)}*\n\nTap a mode below:"
+                    f"🎯 *Select RW Mode* ({g_name} {emoji} | {mode_title})\n"
+                    f"💰 Bet: *{format_money(bet_inr, user_id)}*\n\nTap a mode below:"
                 )
                 edit_message(target_chat, target_msg, rw_msg, reply_markup=rw_mode_keyboard())
                 return jsonify({'status': 'ok'}), 200
