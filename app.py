@@ -30,6 +30,7 @@ withdrawal_history = []
 banned_users = set()
 
 active_games = {}
+active_bj_games = {}
 deposit_states = {}
 withdrawal_states = {}
 admin_states = {}
@@ -53,6 +54,43 @@ VALID_RW_MODES = {
     "2r3w": (2, 3),
     "3r3w": (3, 3),
 }
+
+DECK_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+DECK_SUITS = ["♠", "♥", "♦", "♣"]
+
+def draw_card():
+    rank = random.choice(DECK_RANKS)
+    suit = random.choice(DECK_SUITS)
+    return f"{rank}{suit}"
+
+def card_value(card):
+    rank = card[:-1]
+    if rank == "A":
+        return 11
+    if rank in ["K", "Q", "J", "10"]:
+        return 10
+    return int(rank)
+
+def calculate_hand_total(cards):
+    total = sum(card_value(c) for c in cards)
+    aces = sum(1 for c in cards if c[:-1] == "A")
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    return total
+
+def format_cards(cards):
+    return " ".join(f"`{c}`" for c in cards)
+
+def bj_action_keyboard(can_double=True):
+    row1 = [
+        {"text": "🃏 Hit", "callback_data": "bj_hit"},
+        {"text": "🛑 Stand", "callback_data": "bj_stand"}
+    ]
+    rows = [row1]
+    if can_double:
+        rows.append([{"text": "⚡ Double", "callback_data": "bj_double"}])
+    return {"inline_keyboard": rows}
 
 def format_money(amount_in_inr, user_id):
     curr = user_currency.get(user_id, 'INR')
@@ -172,6 +210,56 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
             st["biggest_win"] = profit_inr
     else:
         st["losses"] += 1
+
+def finish_bj_game(chat_id, user_id, bj, outcome):
+    global HOUSE_BALANCE
+    p_cards = bj["player_cards"]
+    d_cards = bj["dealer_cards"]
+    p_tot = calculate_hand_total(p_cards)
+    d_tot = calculate_hand_total(d_cards)
+    bet = bj["bet"]
+
+    header = (
+        f"🃏 *Blackjack Result*\n\n"
+        f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
+        f"🤖 Dealer Hand: {format_cards(d_cards)} (*{d_tot}*)\n"
+        f"💰 Total Bet: {format_money(bet, user_id)}\n\n"
+    )
+
+    if outcome == "push":
+        user_balances[user_id] += bet
+        update_user_stats(user_id, "blackjack", bet, 0.0, False)
+        body = f"🤝 *Push (Tie)!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+    elif outcome == "win":
+        win_amt = bet * 1.94
+        profit_inr = win_amt - bet
+        user_balances[user_id] += win_amt
+        HOUSE_BALANCE -= profit_inr
+        update_user_stats(user_id, "blackjack", bet, profit_inr, True)
+        body = f"🎉 *You WON {format_money(win_amt, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+    else:
+        profit_inr = -bet
+        HOUSE_BALANCE += bet
+        update_user_stats(user_id, "blackjack", bet, profit_inr, False)
+        reason_txt = "Bust! Over 21." if outcome == "bust" else "Dealer wins."
+        body = f"😢 *You Lost!* {reason_txt}\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+
+    send_message(chat_id, header + body)
+    if user_id in active_bj_games:
+        del active_bj_games[user_id]
+
+def play_dealer_and_settle(chat_id, user_id, bj):
+    p_tot = calculate_hand_total(bj["player_cards"])
+    while calculate_hand_total(bj["dealer_cards"]) < 17:
+        bj["dealer_cards"].append(draw_card())
+    d_tot = calculate_hand_total(bj["dealer_cards"])
+
+    if d_tot > 21 or p_tot > d_tot:
+        finish_bj_game(chat_id, user_id, bj, "win")
+    elif p_tot < d_tot:
+        finish_bj_game(chat_id, user_id, bj, "lose")
+    else:
+        finish_bj_game(chat_id, user_id, bj, "push")
 
 def send_animated_game(chat_id, emoji):
     url = f"{TELEGRAM_API_URL}/sendDice"
@@ -591,6 +679,7 @@ def telegram_webhook():
                         "- `/stats` - View your visual stats card\n"
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n\n"
+                        "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "• Modes: `1r1w`, `2r1w`, `3r1w`, `1r2w`, `2r2w`, `3r2w`, `1r3w`, `2r3w`, `3r3w`\n"
                         "• Add `crazy` for Lowest Sum Wins!\n"
@@ -599,6 +688,45 @@ def telegram_webhook():
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
                     send_message(chat_id, help_text)
+
+                elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id in active_bj_games:
+                        send_message(chat_id, "⚠️ You already have an active Blackjack hand! Use the buttons below your hand.")
+                        return jsonify({'status': 'ok'}), 200
+
+                    parts = text.split()
+                    bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+
+                    if bet_inr is None or bet_inr <= 0:
+                        send_message(chat_id, "⚠️ Enter a valid bet amount. Example: `/bj 50`")
+                    elif bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                    elif user_balances[user_id] < bet_inr:
+                        send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                    else:
+                        user_balances[user_id] -= bet_inr
+                        p_cards = [draw_card(), draw_card()]
+                        d_cards = [draw_card(), draw_card()]
+                        p_tot = calculate_hand_total(p_cards)
+
+                        bj_state = {
+                            "bet": bet_inr,
+                            "player_cards": p_cards,
+                            "dealer_cards": d_cards,
+                            "doubled": False
+                        }
+                        active_bj_games[user_id] = bj_state
+
+                        can_double = user_balances[user_id] >= bet_inr
+                        table_msg = (
+                            f"🃏 *Blackjack Started!*\n\n"
+                            f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
+                            f"🤖 Dealer Shows: `{d_cards[0]}` `[?]`\n"
+                            f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
+                            f"Choose your move:"
+                        )
+                        send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
+                    return jsonify({'status': 'ok'}), 200
                     
                 elif text in ['/balance', '/bal']:
                     if user_id in deposit_states: del deposit_states[user_id]
@@ -876,6 +1004,56 @@ def telegram_webhook():
             if user_id not in user_balances:
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
+
+            if callback_data.startswith("bj_"):
+                if user_id not in active_bj_games:
+                    send_message(chat_id, "⚠️ Blackjack session expired. Start a new game with `/bj <amount>`.")
+                    return jsonify({'status': 'ok'}), 200
+
+                bj = active_bj_games[user_id]
+
+                if callback_data == "bj_hit":
+                    bj["player_cards"].append(draw_card())
+                    p_tot = calculate_hand_total(bj["player_cards"])
+                    if p_tot > 21:
+                        finish_bj_game(chat_id, user_id, bj, "bust")
+                    elif p_tot == 21:
+                        play_dealer_and_settle(chat_id, user_id, bj)
+                    else:
+                        msg = (
+                            f"🃏 *Blackjack (Hit)*\n\n"
+                            f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
+                            f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
+                            f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
+                            f"Choose your next move:"
+                        )
+                        send_message(chat_id, msg, reply_markup=bj_action_keyboard(can_double=False))
+
+                elif callback_data == "bj_stand":
+                    play_dealer_and_settle(chat_id, user_id, bj)
+
+                elif callback_data == "bj_double":
+                    extra_bet = bj["bet"]
+                    if user_balances[user_id] < extra_bet:
+                        send_message(
+                            chat_id,
+                            "❌ Insufficient balance to Double! Choose Hit or Stand:",
+                            reply_markup=bj_action_keyboard(can_double=False)
+                        )
+                        return jsonify({'status': 'ok'}), 200
+
+                    user_balances[user_id] -= extra_bet
+                    bj["bet"] += extra_bet
+                    bj["doubled"] = True
+                    bj["player_cards"].append(draw_card())
+                    p_tot = calculate_hand_total(bj["player_cards"])
+
+                    if p_tot > 21:
+                        finish_bj_game(chat_id, user_id, bj, "bust")
+                    else:
+                        play_dealer_and_settle(chat_id, user_id, bj)
+
+                return jsonify({'status': 'ok'}), 200
                 
             if callback_data == "curr_inr":
                 user_currency[user_id] = 'INR'
