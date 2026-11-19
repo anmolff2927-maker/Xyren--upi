@@ -53,6 +53,8 @@ MAINTENANCE_MODE = False
 DEPOSIT_ENABLED = True
 WITHDRAW_ENABLED = True
 
+PAGE_SIZE = 5
+
 VALID_RW_MODES = {
     "1r1w": (1, 1),
     "2r1w": (2, 1),
@@ -98,10 +100,12 @@ def register_game_record(game_id, kind, owner_id, bet_inr, meta=None, refund_on_
     game_id_registry[game_id] = record
     return record
 
-def mark_game_finished(game_id, status="completed"):
+def mark_game_finished(game_id, status="completed", extra_meta=None):
     if game_id and game_id in game_id_registry:
         game_id_registry[game_id]["status"] = status
         game_id_registry[game_id]["ended_at"] = current_timestamp()
+        if extra_meta:
+            game_id_registry[game_id]["meta"].update(extra_meta)
 
 def record_user_bet(user_id, game_label, bet_inr, pnl_inr, outcome_label, game_id=None):
     if user_id not in user_bet_logs:
@@ -322,7 +326,7 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         label = f"PvP {g_name} ({rw_label}/{mode})"
         record_user_bet(winner_id, label, bet, win_pnl, "WON", game_id=gid)
         record_user_bet(loser_id, label, bet, -bet, "LOST", game_id=gid)
-        mark_game_finished(gid, "completed")
+        mark_game_finished(gid, "completed", extra_meta={"winner_id": winner_id, "payout": payout})
 
         final_text = (
             f"🏁 *Final Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
@@ -533,65 +537,167 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
     else:
         st["losses"] += 1
 
-def build_user_info_report(target_uid):
+def info_menu_keyboard(target_uid):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📥 Deposits", "callback_data": f"infopg_{target_uid}_deposits_0"},
+                {"text": "📤 Withdrawals", "callback_data": f"infopg_{target_uid}_withdrawals_0"},
+                {"text": "🎲 Bets", "callback_data": f"infopg_{target_uid}_bets_0"},
+            ]
+        ]
+    }
+
+def info_page_keyboard(target_uid, section, page, total_items):
+    total_pages = max(1, (total_items + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "⬅️ Previous", "callback_data": f"infopg_{target_uid}_{section}_{page - 1}"})
+    if page + 1 < total_pages:
+        nav_row.append({"text": "➡️ Next", "callback_data": f"infopg_{target_uid}_{section}_{page + 1}"})
+
+    switch_row = []
+    for sec_key, sec_label in [("deposits", "📥 Deposits"), ("withdrawals", "📤 Withdrawals"), ("bets", "🎲 Bets")]:
+        prefix = "• " if sec_key == section else ""
+        switch_row.append({"text": f"{prefix}{sec_label}", "callback_data": f"infopg_{target_uid}_{sec_key}_0"})
+
+    rows = []
+    if nav_row:
+        rows.append(nav_row)
+    rows.append(switch_row)
+    return {"inline_keyboard": rows}
+
+def build_user_info_summary(target_uid):
     bal_str = format_money(user_balances.get(target_uid, 0.0), target_uid)
     curr = user_currency.get(target_uid, "INR")
     uname = user_usernames.get(target_uid)
     uname_str = f"@{uname}" if uname else "N/A"
     status_str = "🔴 BANNED" if target_uid in banned_users else "🟢 Active"
 
-    dep_total = format_money(user_deposits.get(target_uid, 0.0), target_uid)
-    wd_total = format_money(user_withdrawals.get(target_uid, 0.0), target_uid)
-
     u_deps = [d for d in deposit_history if d.get("user") == target_uid]
     u_wds = [w for w in withdrawal_history if w.get("user") == target_uid]
     u_bets = user_bet_logs.get(target_uid, [])
 
+    dep_total = format_money(user_deposits.get(target_uid, 0.0), target_uid)
+    wd_total = format_money(user_withdrawals.get(target_uid, 0.0), target_uid)
+
     lines = [
-        "🪪 *User Full Info*",
+        "🪪 *User Lifetime Info*",
         f"• *User ID:* `{target_uid}`",
         f"• *Username:* {uname_str}",
         f"• *Status:* {status_str}",
         f"• *Currency:* *{curr}*",
         f"• *Current Balance:* *{bal_str}*",
-        f"• *Total Deposited:* *{dep_total}* (`{len(u_deps)}` txns)",
-        f"• *Total Withdrawn:* *{wd_total}* (`{len(u_wds)}` txns)",
-        f"• *Total Bets Logged:* *{len(u_bets)}*",
+        f"• *Lifetime Deposits:* *{dep_total}* (`{len(u_deps)}` txns)",
+        f"• *Lifetime Withdrawals:* *{wd_total}* (`{len(u_wds)}` txns)",
+        f"• *Lifetime Bets:* *{len(u_bets)}*",
         "",
-        "📥 *Recent Deposits:*"
+        "Tap a section below to view lifetime history (5 per page):"
     ]
-    if u_deps:
-        for d in u_deps[-8:]:
-            t_str = d.get("time", "N/A")
-            utr_str = d.get("utr") or "N/A"
-            lines.append(f"  - `{t_str}` | *{format_money(d['amount'], target_uid)}* | UTR: `{utr_str}`")
-    else:
-        lines.append("  - No deposits found.")
+    return "\n".join(lines)
 
-    lines.append("")
-    lines.append("📤 *Recent Withdrawals:*")
-    if u_wds:
-        for w in u_wds[-8:]:
-            t_str = w.get("time", "N/A")
-            upi_str = w.get("upi") or "N/A"
-            lines.append(f"  - `{t_str}` | *{format_money(w['amount'], target_uid)}* | UPI: `{upi_str}`")
-    else:
-        lines.append("  - No withdrawals found.")
+def build_user_info_section_page(target_uid, section, page):
+    uname = user_usernames.get(target_uid)
+    who_str = f"@{uname} (`{target_uid}`)" if uname else f"`{target_uid}`"
 
-    lines.append("")
-    lines.append("🎲 *Recent Bets:*")
-    if u_bets:
-        for b in u_bets[-10:]:
-            gid_part = f"`{b['game_id']}` | " if b.get("game_id") else ""
-            pnl_val = b.get("pnl", 0.0)
-            sign = "+" if pnl_val > 0 else ""
-            pnl_str = f"{sign}{format_money(pnl_val, target_uid)}"
-            lines.append(
-                f"  - {gid_part}*{b['game']}* | Bet: *{format_money(b['bet'], target_uid)}* | "
-                f"*{b['outcome']}* ({pnl_str}) | `{b.get('time', '')}`"
-            )
+    if section == "deposits":
+        records = [d for d in deposit_history if d.get("user") == target_uid]
+        title = "📥 *Lifetime Deposits*"
+    elif section == "withdrawals":
+        records = [w for w in withdrawal_history if w.get("user") == target_uid]
+        title = "📤 *Lifetime Withdrawals*"
     else:
-        lines.append("  - No bets recorded yet.")
+        records = user_bet_logs.get(target_uid, [])
+        title = "🎲 *Lifetime Bets*"
+
+    total_items = len(records)
+    total_pages = max(1, (total_items + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * PAGE_SIZE
+    end_idx = start_idx + PAGE_SIZE
+    slice_items = records[start_idx:end_idx]
+
+    lines = [
+        f"{title} — {who_str}",
+        f"📄 *Page {page + 1} / {total_pages}* (Total: *{total_items}*)",
+        ""
+    ]
+
+    if not slice_items:
+        lines.append("_No records found._")
+    else:
+        for idx, item in enumerate(slice_items, start=start_idx + 1):
+            if section == "deposits":
+                t_str = item.get("time", "N/A")
+                utr_str = item.get("utr") or "N/A"
+                lines.append(f"{idx}. `{t_str}` | *{format_money(item['amount'], target_uid)}* | UTR: `{utr_str}`")
+            elif section == "withdrawals":
+                t_str = item.get("time", "N/A")
+                upi_str = item.get("upi") or "N/A"
+                lines.append(f"{idx}. `{t_str}` | *{format_money(item['amount'], target_uid)}* | UPI: `{upi_str}`")
+            else:
+                gid_part = f"`{item['game_id']}` | " if item.get("game_id") else ""
+                pnl_val = item.get("pnl", 0.0)
+                sign = "+" if pnl_val > 0 else ""
+                pnl_str = f"{sign}{format_money(pnl_val, target_uid)}"
+                lines.append(
+                    f"{idx}. {gid_part}*{item['game']}* | Bet: *{format_money(item['bet'], target_uid)}* | "
+                    f"*{item['outcome']}* ({pnl_str}) | `{item.get('time', '')}`"
+                )
+
+    return "\n".join(lines), info_page_keyboard(target_uid, section, page, total_items)
+
+def build_game_search_report(target_gid):
+    gid = target_gid.strip().upper()
+    rec = game_id_registry.get(gid)
+    if not rec:
+        return f"⚠️ No game found with ID `{gid}`."
+
+    meta = rec.get("meta", {})
+    kind_labels = {
+        "bot_versus": "🤖 Bot Versus",
+        "pvp_match": "⚔️ Player vs Player",
+        "blackjack": "🃏 Blackjack",
+        "prediction": "🔮 Dice Prediction"
+    }
+    kind_str = kind_labels.get(rec.get("kind"), rec.get("kind", "Game"))
+    status_str = str(rec.get("status", "unknown")).upper()
+    owner_id = rec.get("owner_id")
+    bet_inr = rec.get("bet_inr", 0.0)
+
+    lines = [
+        "🔎 *Game ID Details*",
+        f"• *Game ID:* `{gid}`",
+        f"• *Type:* {kind_str}",
+        f"• *Status:* *{status_str}*",
+        f"• *Started By:* `{owner_id}`",
+    ]
+
+    if rec.get("kind") == "pvp_match":
+        p1 = meta.get("p1_id")
+        p2 = meta.get("p2_id")
+        lines.append(f"• *Players:* P1 `{p1}` vs P2 `{p2}`")
+        lines.append(f"• *Bet Each:* *{format_money(bet_inr, owner_id)}*")
+        if meta.get("winner_id"):
+            lines.append(f"• *Winner:* `{meta['winner_id']}`")
+    else:
+        lines.append(f"• *Bet Amount:* *{format_money(bet_inr, owner_id)}*")
+
+    if meta.get("emoji"):
+        g_name = GAME_NAME_MAP.get(meta["emoji"], "Game")
+        lines.append(f"• *Game:* {g_name} ({meta['emoji']})")
+    if meta.get("rw_label") or meta.get("mode"):
+        lines.append(f"• *Format / Mode:* `{meta.get('rw_label', '-')}` / *{meta.get('mode', '-')}*")
+    if meta.get("choice"):
+        lines.append(f"• *Prediction:* *{str(meta['choice']).upper()}*")
+    if meta.get("nums"):
+        lines.append(f"• *Numbers:* `{meta['nums']}`")
+
+    lines.append(f"• *Created At:* `{rec.get('created_at', 'N/A')}`")
+    if rec.get("ended_at"):
+        lines.append(f"• *Ended At:* `{rec.get('ended_at')}`")
 
     return "\n".join(lines)
 
@@ -678,7 +784,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         reason_txt = "Bust! Over 21." if outcome == "bust" else "Dealer wins."
         body = f"😢 *You Lost!* {reason_txt}\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
 
-    mark_game_finished(gid, "completed")
+    mark_game_finished(gid, "completed", extra_meta={"outcome": outcome})
     edit_message(chat_id, message_id, header + body, reply_markup=None)
     if user_id in active_bj_games:
         del active_bj_games[user_id]
@@ -797,6 +903,7 @@ def resolve_round_and_match(chat_id, user_id, game):
             HOUSE_BALANCE -= profit_inr
             update_user_stats(user_id, emoji, bet, profit_inr, True)
             record_user_bet(user_id, label, bet, profit_inr, "WON", game_id=gid)
+            mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
             final_text = (
                 f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
@@ -809,6 +916,7 @@ def resolve_round_and_match(chat_id, user_id, game):
             HOUSE_BALANCE += bet
             update_user_stats(user_id, emoji, bet, profit_inr, False)
             record_user_bet(user_id, label, bet, profit_inr, "LOST", game_id=gid)
+            mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
             final_text = (
                 f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
@@ -816,7 +924,6 @@ def resolve_round_and_match(chat_id, user_id, game):
                 f"💫 *Well played, but the bot got the better of you this time!* Better luck next round."
             )
 
-        mark_game_finished(gid, "completed")
         send_message(chat_id, final_text)
         if user_id in active_games:
             del active_games[user_id]
@@ -1162,7 +1269,18 @@ def telegram_webhook():
                     if target_uid is None:
                         send_message(chat_id, f"⚠️ User `{parts[1]}` not found.")
                         return jsonify({'status': 'ok'}), 200
-                    send_message(chat_id, build_user_info_report(target_uid))
+                    send_message(chat_id, build_user_info_summary(target_uid), reply_markup=info_menu_keyboard(target_uid))
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/search(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized. `/search` is restricted to admins.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, "⚠️ Usage: `/search XC-XXXXXXX-XXXX`")
+                        return jsonify({'status': 'ok'}), 200
+                    send_message(chat_id, build_game_search_report(parts[1]))
                     return jsonify({'status': 'ok'}), 200
 
                 if re.match(rf"^/cancel(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
@@ -1253,7 +1371,8 @@ def telegram_webhook():
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n"
                         "- `/tip <amount> <username>` or reply `/tip <amount>` - Send tip\n"
-                        "- `/cancel <game_id>` - Cancel an active game\n\n"
+                        "- `/cancel <game_id>` - Cancel an active game\n"
+                        "- `/search <game_id>` - Search game info by ID\n\n"
                         "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "• `/dice 50` → Opens menu\n"
@@ -1495,15 +1614,16 @@ def telegram_webhook():
                             HOUSE_BALANCE -= profit_inr
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, True)
                             record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "WON", game_id=gid)
+                            mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
                             result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{multiplier}x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                         else:
                             profit_inr = -bet_inr
                             HOUSE_BALANCE += bet_inr
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, False)
                             record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "LOST", game_id=gid)
+                            mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
                             result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                             
-                        mark_game_finished(gid, "completed")
                         send_message(chat_id, result_text)
                     else:
                         send_message(chat_id, "⚠️ Format error! Use: `/dr <amount> <choice>`\nExample: `/dr 50 high` or `/dr 50 1,3,5`")
@@ -1624,10 +1744,24 @@ def telegram_webhook():
             
             answer_callback(callback_query_id)
             
-            if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_"):
+            if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_") and not callback_data.startswith("infopg_"):
                 remove_inline_keyboard(chat_id, message_id)
             
             register_user_identity(query.get('from'))
+
+            if callback_data.startswith("infopg_"):
+                if user_id not in admin_list:
+                    send_message(chat_id, "⛔ Unauthorized.")
+                    return jsonify({'status': 'ok'}), 200
+                try:
+                    _, raw_uid, section, raw_page = callback_data.split("_", 3)
+                    target_uid = int(raw_uid)
+                    page = int(raw_page)
+                    sec_text, sec_kb = build_user_info_section_page(target_uid, section, page)
+                    edit_message(chat_id, message_id, sec_text, reply_markup=sec_kb)
+                except Exception as e:
+                    print(f"Info pagination error: {e}")
+                return jsonify({'status': 'ok'}), 200
 
             if callback_data == "gs_cancel":
                 setup = pending_game_setup.pop(user_id, None)
