@@ -186,31 +186,27 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     round_num = pvm["round_num"]
     mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
 
+    round_winner = None
     if s1 == s2:
         r_status = "🤝 *Round Tied!* No point awarded."
     elif mode == "crazy":
         if s1 < s2:
             pvm["p1_wins"] += 1
-            r_status = f"🎉 *Player 1 (`{p1}`)* wins this round! (Lower sum wins)"
+            round_winner = p1
+            r_status = f"✨ *Player 1 (`{p1}`)* takes this round! (Lower sum wins)"
         else:
             pvm["p2_wins"] += 1
-            r_status = f"🎉 *Player 2 (`{p2}`)* wins this round! (Lower sum wins)"
+            round_winner = p2
+            r_status = f"✨ *Player 2 (`{p2}`)* takes this round! (Lower sum wins)"
     else:
         if s1 > s2:
             pvm["p1_wins"] += 1
-            r_status = f"🎉 *Player 1 (`{p1}`)* wins this round! (Higher sum wins)"
+            round_winner = p1
+            r_status = f"✨ *Player 1 (`{p1}`)* takes this round! (Higher sum wins)"
         else:
             pvm["p2_wins"] += 1
-            r_status = f"🎉 *Player 2 (`{p2}`)* wins this round! (Higher sum wins)"
-
-    msg = (
-        f"⚔️ *PvP Round {round_num}* ({emoji} | `{rw_label}` | {mode_tag})\n"
-        f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
-        f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n"
-        f"{r_status}\n"
-        f"🏆 Points — P1: *{pvm['p1_wins']}* | P2: *{pvm['p2_wins']}* (First to *{target_wins}*)"
-    )
-    send_message(chat_id, msg)
+            round_winner = p2
+            r_status = f"✨ *Player 2 (`{p2}`)* takes this round! (Higher sum wins)"
 
     if pvm["p1_wins"] >= target_wins or pvm["p2_wins"] >= target_wins:
         winner_id = p1 if pvm["p1_wins"] >= target_wins else p2
@@ -226,11 +222,11 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         update_user_stats(loser_id, emoji, bet, -bet, False)
 
         final_text = (
-            f"🏁 *PvP Match Over ({emoji} | `{rw_label}`)*\n\n"
-            f"👑 *Winner:* `{winner_id}`\n"
-            f"💰 *Payout:* *{format_money(payout, winner_id)}*\n"
-            f"📊 *Final Points:* P1 (`{p1}`): *{pvm['p1_wins']}* — P2 (`{p2}`): *{pvm['p2_wins']}*\n"
-            f"💳 Winner Balance: {format_money(user_balances[winner_id], winner_id)}"
+            f"🏁 *Final Round {round_num}* ({emoji} | `{rw_label}` | {mode_tag})\n"
+            f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
+            f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n\n"
+            f"🌟 *Match Won by `{winner_id}`!* 🌟\n"
+            f"🎁 *Payout:* *{format_money(payout, winner_id)}*"
         )
         send_message(chat_id, final_text)
 
@@ -240,6 +236,15 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         if active_games.get(p2) == match_id:
             active_games.pop(p2, None)
         return
+
+    msg = (
+        f"⚔️ *Round {round_num}* ({emoji} | `{rw_label}` | {mode_tag})\n"
+        f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
+        f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n"
+        f"{r_status}\n"
+        f"🏆 Score — P1: *{pvm['p1_wins']}* | P2: *{pvm['p2_wins']}* (First to *{target_wins}*)"
+    )
+    send_message(chat_id, msg)
 
     pvm["round_num"] += 1
     pvm["p1_rolls"] = []
@@ -552,18 +557,49 @@ def resolve_round_and_match(chat_id, user_id, game):
     elif mode == "crazy":
         if u_sum < b_sum:
             game["user_wins"] += 1
-            r_status = "🎉 *You win this round!* (Lower sum wins)"
+            r_status = "✨ *You took this round!* (Lower sum wins)"
         else:
             game["bot_wins"] += 1
-            r_status = "🤖 *Bot wins this round!* (Lower sum wins)"
+            r_status = "🤖 *Bot took this round!* (Lower sum wins)"
     else:
         if u_sum > b_sum:
             game["user_wins"] += 1
-            r_status = "🎉 *You win this round!* (Higher sum wins)"
+            r_status = "✨ *You took this round!* (Higher sum wins)"
         else:
             game["bot_wins"] += 1
-            r_status = "🤖 *Bot wins this round!* (Higher sum wins)"
-            
+            r_status = "🤖 *Bot took this round!* (Higher sum wins)"
+
+    if game["user_wins"] >= target_wins or game["bot_wins"] >= target_wins:
+        user_won_match = game["user_wins"] >= target_wins
+        if user_won_match:
+            win_amt = bet * 1.94
+            profit_inr = win_amt - bet
+            user_balances[user_id] += win_amt
+            HOUSE_BALANCE -= profit_inr
+            update_user_stats(user_id, emoji, bet, profit_inr, True)
+            final_text = (
+                f"🏁 *Final Round {round_num}* (`{rw_label}` | {mode_tag})\n"
+                f"👤 You: `{u_expr}` = *{u_sum}*\n"
+                f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
+                f"🌟 *Shabash! Kya khel dikhaya hai, aap match jeet gaye!* ✨\n"
+                f"🎁 *Winnings:* *{format_money(win_amt, user_id)}* (`1.94x`)"
+            )
+        else:
+            profit_inr = -bet
+            HOUSE_BALANCE += bet
+            update_user_stats(user_id, emoji, bet, profit_inr, False)
+            final_text = (
+                f"🏁 *Final Round {round_num}* (`{rw_label}` | {mode_tag})\n"
+                f"👤 You: `{u_expr}` = *{u_sum}*\n"
+                f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
+                f"💫 *Koi baat nahi, is baar bot aage nikal gaya!* Agle round mein phir try karo."
+            )
+
+        send_message(chat_id, final_text)
+        if user_id in active_games:
+            del active_games[user_id]
+        return
+
     msg = (
         f"⚔️ *Round {round_num}* (`{rw_label}` | {mode_tag})\n"
         f"👤 You: `{u_expr}` = *{u_sum}*\n"
@@ -572,27 +608,6 @@ def resolve_round_and_match(chat_id, user_id, game):
         f"🏆 Score — You: *{game['user_wins']}* | Bot: *{game['bot_wins']}* (First to *{target_wins}*)"
     )
     send_message(chat_id, msg)
-    
-    if game["user_wins"] >= target_wins or game["bot_wins"] >= target_wins:
-        user_won_match = game["user_wins"] >= target_wins
-        final_text = f"🏁 *Match Over ({emoji} | {rw_label})*\n\n"
-        if user_won_match:
-            win_amt = bet * 1.94
-            profit_inr = win_amt - bet
-            user_balances[user_id] += win_amt
-            HOUSE_BALANCE -= profit_inr
-            update_user_stats(user_id, emoji, bet, profit_inr, True)
-            final_text += f"👑 *BOOYAH! You WON the Match!* 🎉\nPayout: *{format_money(win_amt, user_id)}* (`1.94x`)\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-        else:
-            profit_inr = -bet
-            HOUSE_BALANCE += bet
-            update_user_stats(user_id, emoji, bet, profit_inr, False)
-            final_text += f"😢 *Bot WON the Match!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
-            
-        send_message(chat_id, final_text)
-        if user_id in active_games:
-            del active_games[user_id]
-        return
 
     game["round_num"] += 1
     game["current_user_rolls"] = []
@@ -1679,8 +1694,9 @@ def telegram_webhook():
                     send_message(chat_id, "⛔ Unauthorized.")
                 
             elif callback_data in ["play_user_first", "play_bot_first"]:
+                remove_inline_keyboard(chat_id, message_id)
                 if user_id not in active_games or isinstance(active_games[user_id], str):
-                    edit_message(chat_id, message_id, "⚠️ Session expired. Start a new game.")
+                    send_message(chat_id, "⚠️ Session expired. Start a new game.")
                     return jsonify({'status': 'ok'}), 200
                     
                 game = active_games[user_id]
@@ -1692,11 +1708,11 @@ def telegram_webhook():
                 if callback_data == "play_user_first":
                     game["first_turn"] = "user"
                     game["step"] = "waiting_user_first"
-                    edit_message(chat_id, message_id, f"👤 You chose to roll first!\n\n👉 *Please send `{emoji}` x{rolls_needed} in chat now for Round {game['round_num']}!*")
+                    send_message(chat_id, f"👤 You chose to roll first!\n\n👉 *Please send `{emoji}` x{rolls_needed} in chat now for Round {game['round_num']}!*")
                 else:
                     game["first_turn"] = "bot"
                     game["step"] = "waiting_user_second"
-                    edit_message(chat_id, message_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first...")
+                    send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first...")
                     
                     b_vals = roll_bot_series(chat_id, emoji, rolls_needed)
                     game["current_bot_rolls"] = b_vals
