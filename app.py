@@ -958,15 +958,19 @@ def telegram_webhook():
 
                     parts = text.split()
                     bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+                    current_bal = user_balances.get(user_id, 0.0)
 
                     if bet_inr is None or bet_inr <= 0:
                         send_message(chat_id, "⚠️ Enter a valid bet amount. Example: `/bj 50`")
                     elif bet_inr < MIN_BET or bet_inr > MAX_BET:
                         send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
-                    elif user_balances.get(user_id, 0.0) < bet_inr:
-                        send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                    elif current_bal < bet_inr:
+                        send_message(
+                            chat_id,
+                            f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                        )
                     else:
-                        user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
+                        user_balances[user_id] = current_bal - bet_inr
                         p_cards = [draw_card(), draw_card()]
                         d_cards = [draw_card(), draw_card()]
                         p_tot = calculate_hand_total(p_cards)
@@ -1100,6 +1104,7 @@ def telegram_webhook():
                         
                 elif text.startswith('/dr '):
                     parts = text.split(' ')
+                    current_bal = user_balances.get(user_id, 0.0)
                     if len(parts) == 3 and parts[1].replace('.', '', 1).isdigit():
                         bet_inr = parse_user_amount(parts[1], user_id)
                         arg = parts[2].lower()
@@ -1110,8 +1115,11 @@ def telegram_webhook():
                         elif bet_inr < MIN_BET or bet_inr > MAX_BET:
                             send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                             return jsonify({'status': 'ok'}), 200
-                        elif user_balances.get(user_id, 0.0) < bet_inr:
-                            send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                        elif current_bal < bet_inr:
+                            send_message(
+                                chat_id,
+                                f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                            )
                             return jsonify({'status': 'ok'}), 200
                             
                         is_win = False
@@ -1119,7 +1127,7 @@ def telegram_webhook():
                         win_desc = ""
                         
                         if arg in ['high', 'low', 'odd', 'even']:
-                            user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
+                            user_balances[user_id] = current_bal - bet_inr
                             send_message(chat_id, f"🎲 Rolling dice for Prediction (*{arg.upper()}* | Bet: {format_money(bet_inr, user_id)})...")
                             
                             res = send_animated_game(chat_id, '🎲')
@@ -1139,7 +1147,7 @@ def telegram_webhook():
                                 if not all(1 <= n <= 6 for n in nums) or len(nums) > 5 or len(nums) != len(set(nums)):
                                     raise ValueError()
                                     
-                                user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
+                                user_balances[user_id] = current_bal - bet_inr
                                 send_message(chat_id, f"🎲 Rolling dice for Numbers (*{nums}* | Bet: {format_money(bet_inr, user_id)})...")
                                 
                                 res = send_animated_game(chat_id, '🎲')
@@ -1195,6 +1203,7 @@ def telegram_webhook():
                         mode = None
                         rw_label = None
                         invalid_rw = False
+                        current_bal = user_balances.get(user_id, 0.0)
                         
                         for tok in tokens:
                             low_tok = tok.lower()
@@ -1219,8 +1228,11 @@ def telegram_webhook():
                             send_message(chat_id, "⚠️ Enter a valid bet amount.")
                         elif bet_inr < MIN_BET or bet_inr > MAX_BET:
                             send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
-                        elif user_balances.get(user_id, 0.0) < bet_inr:
-                            send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                        elif current_bal < bet_inr:
+                            send_message(
+                                chat_id,
+                                f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                            )
                         else:
                             g_name = GAME_NAME_MAP.get(triggered_game, "Game")
                             if rw_label is not None and mode is not None:
@@ -1312,14 +1324,19 @@ def telegram_webhook():
                 setup["message_id"] = target_msg
                 bet_inr = setup["bet"]
                 emoji = setup["emoji"]
+                current_bal = user_balances.get(user_id, 0.0)
 
                 if setup.get("rw_label") in VALID_RW_MODES:
                     if bet_inr < MIN_BET or bet_inr > MAX_BET:
                         pending_game_setup.pop(user_id, None)
                         edit_message(target_chat, target_msg, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
-                    elif user_balances.get(user_id, 0.0) < bet_inr:
+                    elif current_bal < bet_inr:
                         pending_game_setup.pop(user_id, None)
-                        edit_message(target_chat, target_msg, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                        edit_message(
+                            target_chat,
+                            target_msg,
+                            f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                        )
                     else:
                         conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, chosen_mode, setup["rw_label"])
                         edit_message(target_chat, target_msg, conf_msg, reply_markup=match_confirm_keyboard(target_chat_type))
@@ -1350,13 +1367,18 @@ def telegram_webhook():
                 setup["mode"] = mode
                 setup["rw_label"] = chosen_rw
                 emoji = setup["emoji"]
+                current_bal = user_balances.get(user_id, 0.0)
 
                 if bet_inr < MIN_BET or bet_inr > MAX_BET:
                     pending_game_setup.pop(user_id, None)
                     edit_message(target_chat, target_msg, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
-                elif user_balances.get(user_id, 0.0) < bet_inr:
+                elif current_bal < bet_inr:
                     pending_game_setup.pop(user_id, None)
-                    edit_message(target_chat, target_msg, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                    edit_message(
+                        target_chat,
+                        target_msg,
+                        f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                    )
                 else:
                     conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, mode, chosen_rw)
                     edit_message(target_chat, target_msg, conf_msg, reply_markup=match_confirm_keyboard(target_chat_type))
@@ -1370,10 +1392,15 @@ def telegram_webhook():
                 target_chat = conf.get("chat_id") or chat_id
                 target_msg = conf.get("message_id") or message_id
                 bet_inr = conf["bet"]
+                current_bal = user_balances.get(user_id, 0.0)
                 if bet_inr < MIN_BET or bet_inr > MAX_BET:
                     edit_message(target_chat, target_msg, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
-                elif user_balances.get(user_id, 0.0) < bet_inr:
-                    edit_message(target_chat, target_msg, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                elif current_bal < bet_inr:
+                    edit_message(
+                        target_chat,
+                        target_msg,
+                        f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                    )
                 else:
                     start_versus_match(target_chat, target_msg, user_id, conf["emoji"], bet_inr, conf["mode"] or "normal", conf["rw_label"])
                 return jsonify({'status': 'ok'}), 200
@@ -1392,11 +1419,16 @@ def telegram_webhook():
                     return jsonify({'status': 'ok'}), 200
 
                 bet_inr = conf["bet"]
+                current_bal = user_balances.get(user_id, 0.0)
                 if bet_inr < MIN_BET or bet_inr > MAX_BET:
                     edit_message(target_chat, target_msg, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                     return jsonify({'status': 'ok'}), 200
-                if user_balances.get(user_id, 0.0) < bet_inr:
-                    edit_message(target_chat, target_msg, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                if current_bal < bet_inr:
+                    edit_message(
+                        target_chat,
+                        target_msg,
+                        f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                    )
                     return jsonify({'status': 'ok'}), 200
 
                 challenge_id = uuid.uuid4().hex[:8]
