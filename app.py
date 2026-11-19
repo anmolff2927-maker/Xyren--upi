@@ -186,26 +186,21 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     round_num = pvm["round_num"]
     mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
 
-    round_winner = None
     if s1 == s2:
         r_status = "🤝 *Round Tied!* No point awarded."
     elif mode == "crazy":
         if s1 < s2:
             pvm["p1_wins"] += 1
-            round_winner = p1
             r_status = f"✨ *Player 1 (`{p1}`)* takes this round! (Lower sum wins)"
         else:
             pvm["p2_wins"] += 1
-            round_winner = p2
             r_status = f"✨ *Player 2 (`{p2}`)* takes this round! (Lower sum wins)"
     else:
         if s1 > s2:
             pvm["p1_wins"] += 1
-            round_winner = p1
             r_status = f"✨ *Player 1 (`{p1}`)* takes this round! (Higher sum wins)"
         else:
             pvm["p2_wins"] += 1
-            round_winner = p2
             r_status = f"✨ *Player 2 (`{p2}`)* takes this round! (Higher sum wins)"
 
     if pvm["p1_wins"] >= target_wins or pvm["p2_wins"] >= target_wins:
@@ -581,7 +576,7 @@ def resolve_round_and_match(chat_id, user_id, game):
                 f"🏁 *Final Round {round_num}* (`{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
                 f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
-                f"🌟 *Shabash! Kya khel dikhaya hai, aap match jeet gaye!* ✨\n"
+                f"🎉 *Congratulations! You won the match!* ✨\n"
                 f"🎁 *Winnings:* *{format_money(win_amt, user_id)}* (`1.94x`)"
             )
         else:
@@ -592,7 +587,7 @@ def resolve_round_and_match(chat_id, user_id, game):
                 f"🏁 *Final Round {round_num}* (`{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
                 f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
-                f"💫 *Koi baat nahi, is baar bot aage nikal gaya!* Agle round mein phir try karo."
+                f"💫 *Well played, but the bot got the better of you this time!* Better luck next round."
             )
 
         send_message(chat_id, final_text)
