@@ -122,6 +122,25 @@ def send_message(chat_id, text, reply_markup=None):
         print(f"Error sending message: {e}")
         return None
 
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    url = f"{TELEGRAM_API_URL}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    else:
+        payload["reply_markup"] = {"inline_keyboard": []}
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        return res.json()
+    except Exception as e:
+        print(f"Error editing message: {e}")
+        return None
+
 def answer_callback(callback_query_id, text=""):
     url = f"{TELEGRAM_API_URL}/answerCallbackQuery"
     payload = {"callback_query_id": callback_query_id, "text": text}
@@ -211,7 +230,7 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
     else:
         st["losses"] += 1
 
-def finish_bj_game(chat_id, user_id, bj, outcome):
+def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
     global HOUSE_BALANCE
     p_cards = bj["player_cards"]
     d_cards = bj["dealer_cards"]
@@ -244,22 +263,22 @@ def finish_bj_game(chat_id, user_id, bj, outcome):
         reason_txt = "Bust! Over 21." if outcome == "bust" else "Dealer wins."
         body = f"😢 *You Lost!* {reason_txt}\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
 
-    send_message(chat_id, header + body)
+    edit_message(chat_id, message_id, header + body, reply_markup=None)
     if user_id in active_bj_games:
         del active_bj_games[user_id]
 
-def play_dealer_and_settle(chat_id, user_id, bj):
+def play_dealer_and_settle(chat_id, message_id, user_id, bj):
     p_tot = calculate_hand_total(bj["player_cards"])
     while calculate_hand_total(bj["dealer_cards"]) < 17:
         bj["dealer_cards"].append(draw_card())
     d_tot = calculate_hand_total(bj["dealer_cards"])
 
     if d_tot > 21 or p_tot > d_tot:
-        finish_bj_game(chat_id, user_id, bj, "win")
+        finish_bj_game(chat_id, message_id, user_id, bj, "win")
     elif p_tot < d_tot:
-        finish_bj_game(chat_id, user_id, bj, "lose")
+        finish_bj_game(chat_id, message_id, user_id, bj, "lose")
     else:
-        finish_bj_game(chat_id, user_id, bj, "push")
+        finish_bj_game(chat_id, message_id, user_id, bj, "push")
 
 def send_animated_game(chat_id, emoji):
     url = f"{TELEGRAM_API_URL}/sendDice"
@@ -675,6 +694,7 @@ def telegram_webhook():
                         f"🎰 *Welcome to {BOT_USERNAME} Casino!* 🎲\n\n"
                         "Commands:\n"
                         "- `/balance` or `/bal` - Check wallet balance\n"
+                        "- `/hb` - Check House Balance\n"
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
@@ -689,9 +709,12 @@ def telegram_webhook():
                     )
                     send_message(chat_id, help_text)
 
+                elif re.match(rf"^/hb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
+                    send_message(chat_id, f"🏦 *House Balance:* *{format_money(HOUSE_BALANCE, user_id)}*")
+
                 elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id in active_bj_games:
-                        send_message(chat_id, "⚠️ You already have an active Blackjack hand! Use the buttons below your hand.")
+                        send_message(chat_id, "⚠️ You already have an active Blackjack hand! Use the buttons on your current game message.")
                         return jsonify({'status': 'ok'}), 200
 
                     parts = text.split()
@@ -709,14 +732,6 @@ def telegram_webhook():
                         d_cards = [draw_card(), draw_card()]
                         p_tot = calculate_hand_total(p_cards)
 
-                        bj_state = {
-                            "bet": bet_inr,
-                            "player_cards": p_cards,
-                            "dealer_cards": d_cards,
-                            "doubled": False
-                        }
-                        active_bj_games[user_id] = bj_state
-
                         can_double = user_balances[user_id] >= bet_inr
                         table_msg = (
                             f"🃏 *Blackjack Started!*\n\n"
@@ -725,7 +740,17 @@ def telegram_webhook():
                             f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
                             f"Choose your move:"
                         )
-                        send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
+                        sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
+                        msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+
+                        active_bj_games[user_id] = {
+                            "chat_id": chat_id,
+                            "message_id": msg_id,
+                            "bet": bet_inr,
+                            "player_cards": p_cards,
+                            "dealer_cards": d_cards,
+                            "doubled": False
+                        }
                     return jsonify({'status': 'ok'}), 200
                     
                 elif text in ['/balance', '/bal']:
@@ -998,7 +1023,7 @@ def telegram_webhook():
             
             answer_callback(callback_query_id)
             
-            if not callback_data.startswith("adm_"):
+            if not callback_data.startswith("adm_") and not callback_data.startswith("bj_"):
                 remove_inline_keyboard(chat_id, message_id)
             
             if user_id not in user_balances:
@@ -1007,18 +1032,20 @@ def telegram_webhook():
 
             if callback_data.startswith("bj_"):
                 if user_id not in active_bj_games:
-                    send_message(chat_id, "⚠️ Blackjack session expired. Start a new game with `/bj <amount>`.")
+                    edit_message(chat_id, message_id, "⚠️ Blackjack session expired. Start a new game with `/bj <amount>`.")
                     return jsonify({'status': 'ok'}), 200
 
                 bj = active_bj_games[user_id]
+                target_chat = bj.get("chat_id") or chat_id
+                target_msg = bj.get("message_id") or message_id
 
                 if callback_data == "bj_hit":
                     bj["player_cards"].append(draw_card())
                     p_tot = calculate_hand_total(bj["player_cards"])
                     if p_tot > 21:
-                        finish_bj_game(chat_id, user_id, bj, "bust")
+                        finish_bj_game(target_chat, target_msg, user_id, bj, "bust")
                     elif p_tot == 21:
-                        play_dealer_and_settle(chat_id, user_id, bj)
+                        play_dealer_and_settle(target_chat, target_msg, user_id, bj)
                     else:
                         msg = (
                             f"🃏 *Blackjack (Hit)*\n\n"
@@ -1027,19 +1054,23 @@ def telegram_webhook():
                             f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
                             f"Choose your next move:"
                         )
-                        send_message(chat_id, msg, reply_markup=bj_action_keyboard(can_double=False))
+                        edit_message(target_chat, target_msg, msg, reply_markup=bj_action_keyboard(can_double=False))
 
                 elif callback_data == "bj_stand":
-                    play_dealer_and_settle(chat_id, user_id, bj)
+                    play_dealer_and_settle(target_chat, target_msg, user_id, bj)
 
                 elif callback_data == "bj_double":
                     extra_bet = bj["bet"]
                     if user_balances[user_id] < extra_bet:
-                        send_message(
-                            chat_id,
-                            "❌ Insufficient balance to Double! Choose Hit or Stand:",
-                            reply_markup=bj_action_keyboard(can_double=False)
+                        p_tot = calculate_hand_total(bj["player_cards"])
+                        msg = (
+                            f"🃏 *Blackjack*\n\n"
+                            f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
+                            f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
+                            f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
+                            f"❌ Insufficient balance to Double! Choose Hit or Stand:"
                         )
+                        edit_message(target_chat, target_msg, msg, reply_markup=bj_action_keyboard(can_double=False))
                         return jsonify({'status': 'ok'}), 200
 
                     user_balances[user_id] -= extra_bet
@@ -1049,9 +1080,9 @@ def telegram_webhook():
                     p_tot = calculate_hand_total(bj["player_cards"])
 
                     if p_tot > 21:
-                        finish_bj_game(chat_id, user_id, bj, "bust")
+                        finish_bj_game(target_chat, target_msg, user_id, bj, "bust")
                     else:
-                        play_dealer_and_settle(chat_id, user_id, bj)
+                        play_dealer_and_settle(target_chat, target_msg, user_id, bj)
 
                 return jsonify({'status': 'ok'}), 200
                 
