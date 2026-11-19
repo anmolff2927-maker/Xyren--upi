@@ -16,6 +16,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 BOT_USERNAME = "@Xyren_upibot"
 WINS_CHANNEL_ID = os.environ.get("WINS_CHANNEL_ID", "3555754688")
+WINS_CHANNEL_USERNAME = "xyren_wins"
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -57,6 +58,26 @@ WITHDRAW_ENABLED = True
 
 PAGE_SIZE = 5
 
+GAME_MULTIPLIERS = {
+    "dice": 1.94,
+    "dart": 1.94,
+    "foot": 1.94,
+    "basket": 1.94,
+    "bowl": 1.94,
+    "pvp": 1.94,
+    "bj": 1.94,
+    "dr": 1.92,
+    "dr_nums": {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15},
+}
+
+EMOJI_TO_MULT_KEY = {
+    "🎲": "dice",
+    "🎯": "dart",
+    "⚽": "foot",
+    "🏀": "basket",
+    "🎳": "bowl",
+}
+
 VALID_RW_MODES = {
     "1r1w": (1, 1),
     "2r1w": (2, 1),
@@ -76,6 +97,14 @@ GAME_NAME_MAP = {
     "🏀": "Basketball",
     "🎳": "Bowling",
 }
+
+def fmt_mult(val):
+    s = f"{float(val):.4f}".rstrip("0").rstrip(".")
+    return f"{s}x"
+
+def get_versus_multiplier(emoji):
+    key = EMOJI_TO_MULT_KEY.get(emoji, "dice")
+    return float(GAME_MULTIPLIERS.get(key, 1.94))
 
 def normalize_channel_id(raw_id):
     if raw_id is None:
@@ -101,13 +130,14 @@ def format_win_actor(user_id):
 
 def log_win_to_channel(user_id, game_emoji, game_title, won_inr, mult_text=None):
     target_channel = normalize_channel_id(WINS_CHANNEL_ID)
-    if not target_channel:
-        return
     actor = format_win_actor(user_id)
     amt_str = f"₹{won_inr:,.2f}"
     mult_part = f" `({mult_text})`" if mult_text else ""
     msg = f"{game_emoji} *{game_title}* · *{actor}* won *{amt_str}*{mult_part}"
-    send_message(target_channel, msg)
+
+    res = send_message(target_channel, msg) if target_channel else None
+    if (not res or not res.get("ok")) and WINS_CHANNEL_USERNAME:
+        send_message(f"@{WINS_CHANNEL_USERNAME}", msg)
 
 def current_timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -350,9 +380,9 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         winner_id = p1 if pvm["p1_wins"] >= target_wins else p2
         loser_id = p2 if winner_id == p1 else p1
 
-        total_pot = bet * 2
-        payout = total_pot * 0.97
-        house_fee = total_pot - payout
+        mult = float(GAME_MULTIPLIERS.get("pvp", 1.94))
+        payout = bet * mult
+        house_fee = max(0.0, (bet * 2) - payout)
         HOUSE_BALANCE += house_fee
 
         win_pnl = payout - bet
@@ -364,14 +394,14 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         record_user_bet(winner_id, label, bet, win_pnl, "WON", game_id=gid)
         record_user_bet(loser_id, label, bet, -bet, "LOST", game_id=gid)
         mark_game_finished(gid, "completed", extra_meta={"winner_id": winner_id, "payout": payout})
-        log_win_to_channel(winner_id, emoji, f"PvP {g_name}", payout, "1.94x")
+        log_win_to_channel(winner_id, emoji, f"PvP {g_name}", payout, fmt_mult(mult))
 
         final_text = (
             f"🏁 *Final Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
             f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
             f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n\n"
             f"🌟 *Match Won by `{winner_id}`!* 🌟\n"
-            f"🎁 *Payout:* *{format_money(payout, winner_id)}*"
+            f"🎁 *Payout:* *{format_money(payout, winner_id)}* (`{fmt_mult(mult)}`)"
         )
         send_message(chat_id, final_text)
 
@@ -793,6 +823,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
     p_tot = calculate_hand_total(p_cards)
     d_tot = calculate_hand_total(d_cards)
     bet = bj["bet"]
+    mult = float(GAME_MULTIPLIERS.get("bj", 1.94))
 
     header = (
         f"🃏 *Blackjack Result* (`{gid}`)\n\n"
@@ -807,14 +838,14 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         record_user_bet(user_id, "Blackjack", bet, 0.0, "PUSH", game_id=gid)
         body = f"🤝 *Push (Tie)!* Bet refunded.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
     elif outcome == "win":
-        win_amt = bet * 1.94
+        win_amt = bet * mult
         profit_inr = win_amt - bet
         user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
         HOUSE_BALANCE -= profit_inr
         update_user_stats(user_id, "blackjack", bet, profit_inr, True)
         record_user_bet(user_id, "Blackjack", bet, profit_inr, "WON", game_id=gid)
-        log_win_to_channel(user_id, "🃏", "Blackjack", win_amt, "1.94x")
-        body = f"🎉 *You WON {format_money(win_amt, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+        log_win_to_channel(user_id, "🃏", "Blackjack", win_amt, fmt_mult(mult))
+        body = f"🎉 *You WON {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
     else:
         profit_inr = -bet
         HOUSE_BALANCE += bet
@@ -936,20 +967,21 @@ def resolve_round_and_match(chat_id, user_id, game):
         user_won_match = game["user_wins"] >= target_wins
         label = f"Bot {g_name} ({rw_label}/{mode})"
         if user_won_match:
-            win_amt = bet * 1.94
+            mult = get_versus_multiplier(emoji)
+            win_amt = bet * mult
             profit_inr = win_amt - bet
             user_balances[user_id] = user_balances.get(user_id, 0.0) + win_amt
             HOUSE_BALANCE -= profit_inr
             update_user_stats(user_id, emoji, bet, profit_inr, True)
             record_user_bet(user_id, label, bet, profit_inr, "WON", game_id=gid)
             mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
-            log_win_to_channel(user_id, emoji, g_name, win_amt, "1.94x")
+            log_win_to_channel(user_id, emoji, g_name, win_amt, fmt_mult(mult))
             final_text = (
                 f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
                 f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
                 f"🎉 *Congratulations! You won the match!* ✨\n"
-                f"🎁 *Winnings:* *{format_money(win_amt, user_id)}* (`1.94x`)"
+                f"🎁 *Winnings:* *{format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)"
             )
         else:
             profit_inr = -bet
@@ -1283,6 +1315,82 @@ def telegram_webhook():
 
             if 'text' in message:
                 text = message['text'].strip()
+
+                mult_cmd_map = {
+                    "/setmultidice": "dice",
+                    "/setmultidart": "dart",
+                    "/setmultifoot": "foot",
+                    "/setmultibasket": "basket",
+                    "/setmultibowl": "bowl",
+                    "/setmultiboel": "bowl",
+                    "/setmultipvp": "pvp",
+                    "/setmultibj": "bj",
+                    "/setmultidr": "dr",
+                }
+
+                matched_mult_key = None
+                for cmd_prefix, m_key in mult_cmd_map.items():
+                    if re.match(rf"^{re.escape(cmd_prefix)}(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                        matched_mult_key = m_key
+                        break
+
+                if matched_mult_key:
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        cur_m = GAME_MULTIPLIERS.get(matched_mult_key)
+                        send_message(chat_id, f"⚙️ Current `{matched_mult_key}` multiplier: *{fmt_mult(cur_m)}*\nUsage: `{parts[0]} <multiplier>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        new_val = float(parts[1])
+                        if new_val <= 0 or new_val > 100:
+                            raise ValueError()
+                        GAME_MULTIPLIERS[matched_mult_key] = new_val
+                        send_message(chat_id, f"✅ Updated `{matched_mult_key}` multiplier to *{fmt_mult(new_val)}*.")
+                    except ValueError:
+                        send_message(chat_id, "⚠️ Enter a valid positive multiplier (e.g. `1.94`, `1.9`, `2`).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/setmultidrnum(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 3:
+                        send_message(chat_id, "⚠️ Usage: `/setmultidrnum <1-5> <multiplier>` (e.g. `/setmultidrnum 3 1.92`)")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        cnt = int(parts[1])
+                        new_val = float(parts[2])
+                        if cnt not in [1, 2, 3, 4, 5] or new_val <= 0 or new_val > 100:
+                            raise ValueError()
+                        GAME_MULTIPLIERS["dr_nums"][cnt] = new_val
+                        send_message(chat_id, f"✅ Updated `/dr` ({cnt} number(s)) multiplier to *{fmt_mult(new_val)}*.")
+                    except ValueError:
+                        send_message(chat_id, "⚠️ Invalid input. Count must be `1`–`5` and multiplier `> 0`.")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/mults(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    dr_nums_str = ", ".join(f"{k}n: {fmt_mult(v)}" for k, v in GAME_MULTIPLIERS["dr_nums"].items())
+                    txt = (
+                        "⚙️ *Active Game Multipliers*\n\n"
+                        f"• Dice: *{fmt_mult(GAME_MULTIPLIERS['dice'])}*\n"
+                        f"• Dart: *{fmt_mult(GAME_MULTIPLIERS['dart'])}*\n"
+                        f"• Football: *{fmt_mult(GAME_MULTIPLIERS['foot'])}*\n"
+                        f"• Basketball: *{fmt_mult(GAME_MULTIPLIERS['basket'])}*\n"
+                        f"• Bowling: *{fmt_mult(GAME_MULTIPLIERS['bowl'])}*\n"
+                        f"• PvP: *{fmt_mult(GAME_MULTIPLIERS['pvp'])}*\n"
+                        f"• Blackjack: *{fmt_mult(GAME_MULTIPLIERS['bj'])}*\n"
+                        f"• Predict (H/L/O/E): *{fmt_mult(GAME_MULTIPLIERS['dr'])}*\n"
+                        f"• Predict Numbers: `{dr_nums_str}`"
+                    )
+                    send_message(chat_id, txt)
+                    return jsonify({'status': 'ok'}), 200
                 
                 if text.startswith('/approve '):
                     if user_id in admin_list:
@@ -1619,7 +1727,7 @@ def telegram_webhook():
                             elif arg == 'odd' and dice_val in [1, 3, 5]: is_win = True
                             elif arg == 'even' and dice_val in [2, 4, 6]: is_win = True
                             
-                            multiplier = 1.92
+                            multiplier = float(GAME_MULTIPLIERS.get("dr", 1.92))
                             win_desc = f"Prediction: {arg.upper()}"
                         else:
                             try:
@@ -1639,8 +1747,8 @@ def telegram_webhook():
                                 if dice_val in nums: is_win = True
                                 
                                 count = len(nums)
-                                mult_map = {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15}
-                                multiplier = mult_map.get(count, 1.0)
+                                dr_num_map = GAME_MULTIPLIERS.get("dr_nums", {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15})
+                                multiplier = float(dr_num_map.get(count, 1.0))
                                 win_desc = f"Numbers: {nums}"
                             except:
                                 send_message(chat_id, "⚠️ Invalid format! Use `high`, `low`, `odd`, `even` or numbers like `2,4,6`.\nExample: `/dr 50 2,4,6`")
@@ -1655,8 +1763,8 @@ def telegram_webhook():
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, True)
                             record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "WON", game_id=gid)
                             mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
-                            log_win_to_channel(user_id, "🔮", "Predict", win_amt, f"{multiplier}x")
-                            result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{multiplier}x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                            log_win_to_channel(user_id, "🔮", "Predict", win_amt, fmt_mult(multiplier))
+                            result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{fmt_mult(multiplier)}`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                         else:
                             profit_inr = -bet_inr
                             HOUSE_BALANCE += bet_inr
