@@ -23,6 +23,8 @@ approved_groups = set()
 
 user_balances = {}
 user_currency = {}
+user_usernames = {}
+username_to_id = {}
 user_stats = {}
 user_deposits = {}
 user_withdrawals = {}
@@ -66,6 +68,31 @@ GAME_NAME_MAP = {
     "🏀": "Basketball",
     "🎳": "Bowling",
 }
+
+def register_user_identity(from_user):
+    if not from_user:
+        return None
+    uid = from_user.get("id")
+    if uid is None:
+        return None
+    if uid not in user_balances:
+        user_balances[uid] = 0.0
+        user_currency[uid] = 'INR'
+    uname = from_user.get("username")
+    if uname:
+        clean_uname = uname.lstrip("@").lower()
+        old_uname = user_usernames.get(uid)
+        if old_uname and old_uname != clean_uname and username_to_id.get(old_uname) == uid:
+            del username_to_id[old_uname]
+        user_usernames[uid] = clean_uname
+        username_to_id[clean_uname] = uid
+    return uid
+
+def display_sender_label(user_id):
+    uname = user_usernames.get(user_id)
+    if uname:
+        return f"@{uname}"
+    return f"`{user_id}`"
 
 def game_style_keyboard():
     return {
@@ -643,6 +670,9 @@ def telegram_webhook():
             chat_id = message['chat'].get('id')
             chat_type = message['chat'].get('type')
             user_id = message['from'].get('id')
+
+            if 'reply_to_message' in message and message['reply_to_message'].get('from'):
+                register_user_identity(message['reply_to_message']['from'])
             
             if chat_type in ['group', 'supergroup'] and chat_id not in approved_groups and user_id not in admin_list:
                 if 'text' in message and message['text'].startswith('/myid'):
@@ -657,9 +687,7 @@ def telegram_webhook():
                 send_message(chat_id, "🛠 *Bot is under Maintenance.* Please try again later.")
                 return jsonify({'status': 'ok'}), 200
                 
-            if user_id not in user_balances:
-                user_balances[user_id] = 0.0
-                user_currency[user_id] = 'INR'
+            register_user_identity(message.get('from'))
                 
             if user_id in admin_list and user_id in admin_states and 'text' in message:
                 state = admin_states[user_id]
@@ -928,6 +956,65 @@ def telegram_webhook():
                         send_message(chat_id, "⛔ Unauthorized.")
                     return jsonify({'status': 'ok'}), 200
 
+                if re.match(rf"^/tip(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    parts = text.split()
+                    current_bal = user_balances.get(user_id, 0.0)
+                    receiver_id = None
+                    amt_inr = None
+
+                    if 'reply_to_message' in message and message['reply_to_message'].get('from'):
+                        reply_from = message['reply_to_message']['from']
+                        if not reply_from.get('is_bot'):
+                            receiver_id = register_user_identity(reply_from)
+                        if len(parts) >= 2:
+                            amt_inr = parse_user_amount(parts[1], user_id)
+                    else:
+                        if len(parts) >= 3:
+                            amt_inr = parse_user_amount(parts[1], user_id)
+                            target_uname = parts[2].lstrip("@").lower()
+                            receiver_id = username_to_id.get(target_uname)
+                        elif len(parts) == 2:
+                            send_message(chat_id, "⚠️ Reply to a user's message with `/tip <amount>` or use `/tip <amount> <username>`.")
+                            return jsonify({'status': 'ok'}), 200
+                        else:
+                            send_message(chat_id, "⚠️ Usage: `/tip <amount> <username>` or reply to a message with `/tip <amount>`.")
+                            return jsonify({'status': 'ok'}), 200
+
+                    if amt_inr is None or amt_inr <= 0:
+                        send_message(chat_id, "⚠️ Enter a valid tip amount. Example: `/tip 50 @username`")
+                        return jsonify({'status': 'ok'}), 200
+
+                    if receiver_id is None:
+                        send_message(chat_id, "⚠️ Recipient not found! Make sure they have interacted with the bot or reply directly to their message.")
+                        return jsonify({'status': 'ok'}), 200
+
+                    if receiver_id == user_id:
+                        send_message(chat_id, "⚠️ You cannot tip yourself!")
+                        return jsonify({'status': 'ok'}), 200
+
+                    if current_bal < amt_inr:
+                        send_message(
+                            chat_id,
+                            f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Tip: *{format_money(amt_inr, user_id)}*"
+                        )
+                        return jsonify({'status': 'ok'}), 200
+
+                    if receiver_id not in user_balances:
+                        user_balances[receiver_id] = 0.0
+                        user_currency[receiver_id] = 'INR'
+
+                    user_balances[user_id] = current_bal - amt_inr
+                    user_balances[receiver_id] = user_balances.get(receiver_id, 0.0) + amt_inr
+
+                    sender_label = display_sender_label(user_id)
+                    amt_for_receiver = format_money(amt_inr, receiver_id)
+                    amt_for_sender = format_money(amt_inr, user_id)
+
+                    send_message(receiver_id, f"{amt_for_receiver} tip recived from {sender_label}")
+                    if chat_id != receiver_id:
+                        send_message(chat_id, f"✅ Sent *{amt_for_sender}* tip to {display_sender_label(receiver_id)}!")
+                    return jsonify({'status': 'ok'}), 200
+
                 if text == '/start':
                     help_text = (
                         f"🎰 *Welcome to {BOT_USERNAME} Casino!* 🎲\n\n"
@@ -937,7 +1024,8 @@ def telegram_webhook():
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
-                        "- `/withdraw` - Withdraw your winnings (DM Only)\n\n"
+                        "- `/withdraw` - Withdraw your winnings (DM Only)\n"
+                        "- `/tip <amount> <username>` or reply `/tip <amount>` - Send tip\n\n"
                         "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "• `/dice 50` → Opens menu\n"
@@ -1297,9 +1385,7 @@ def telegram_webhook():
             if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_"):
                 remove_inline_keyboard(chat_id, message_id)
             
-            if user_id not in user_balances:
-                user_balances[user_id] = 0.0
-                user_currency[user_id] = 'INR'
+            register_user_identity(query.get('from'))
 
             if callback_data == "gs_cancel":
                 setup = pending_game_setup.pop(user_id, None)
