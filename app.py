@@ -934,8 +934,9 @@ def telegram_webhook():
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n\n"
                         "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
-                        "• Pick *Crazy* or *Normal* → `1r1w`–`3r3w` → *Against Bot* or *Against Player*\n"
-                        "• Example: `/dice 50`\n\n"
+                        "• `/dice 50` → Opens menu\n"
+                        "• `/dice 50 1r1w` → Auto `normal` mode + direct confirmation\n"
+                        "• `/dice 50 1r1w crazy` → `crazy` mode + direct confirmation\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
@@ -1199,6 +1200,9 @@ def telegram_webhook():
                                 parsed = parse_user_amount(tok, user_id)
                                 if parsed is not None:
                                     bet_inr = parsed
+
+                        if rw_label is not None and mode is None:
+                            mode = "normal"
                                     
                         if invalid_rw:
                             send_message(chat_id, "⚠️ Invalid RW mode! Allowed modes: `1r1w`, `2r1w`, `3r1w`, `1r2w`, `2r2w`, `3r2w`, `1r3w`, `2r3w`, `3r3w`.")
@@ -1210,7 +1214,19 @@ def telegram_webhook():
                             send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
                         else:
                             g_name = GAME_NAME_MAP.get(triggered_game, "Game")
-                            if mode is None:
+                            if rw_label is not None and mode is not None:
+                                conf_msg = build_match_confirmation_text(user_id, triggered_game, bet_inr, mode, rw_label)
+                                sent = send_message(chat_id, conf_msg, reply_markup=match_confirm_keyboard())
+                                msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+                                pending_game_setup[user_id] = {
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "emoji": triggered_game,
+                                    "bet": bet_inr,
+                                    "mode": mode,
+                                    "rw_label": rw_label
+                                }
+                            elif mode is None:
                                 setup_msg = (
                                     f"🎮 *{g_name} ({triggered_game}) Setup*\n"
                                     f"💰 Bet: *{format_money(bet_inr, user_id)}*\n\n"
@@ -1226,7 +1242,7 @@ def telegram_webhook():
                                     "mode": None,
                                     "rw_label": None
                                 }
-                            elif rw_label is None:
+                            else:
                                 mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
                                 rw_msg = (
                                     f"🎯 *Select RW Mode* ({g_name} {triggered_game} | {mode_title})\n"
@@ -1241,18 +1257,6 @@ def telegram_webhook():
                                     "bet": bet_inr,
                                     "mode": mode,
                                     "rw_label": None
-                                }
-                            else:
-                                conf_msg = build_match_confirmation_text(user_id, triggered_game, bet_inr, mode, rw_label)
-                                sent = send_message(chat_id, conf_msg, reply_markup=match_confirm_keyboard())
-                                msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
-                                pending_game_setup[user_id] = {
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "emoji": triggered_game,
-                                    "bet": bet_inr,
-                                    "mode": mode,
-                                    "rw_label": rw_label
                                 }
 
         elif 'callback_query' in data:
@@ -1295,6 +1299,18 @@ def telegram_webhook():
                 setup["message_id"] = target_msg
                 bet_inr = setup["bet"]
                 emoji = setup["emoji"]
+
+                if setup.get("rw_label") in VALID_RW_MODES:
+                    if bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        pending_game_setup.pop(user_id, None)
+                        edit_message(target_chat, target_msg, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                    elif user_balances[user_id] < bet_inr:
+                        pending_game_setup.pop(user_id, None)
+                        edit_message(target_chat, target_msg, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                    else:
+                        conf_msg = build_match_confirmation_text(user_id, emoji, bet_inr, chosen_mode, setup["rw_label"])
+                        edit_message(target_chat, target_msg, conf_msg, reply_markup=match_confirm_keyboard())
+                    return jsonify({'status': 'ok'}), 200
 
                 g_name = GAME_NAME_MAP.get(emoji, "Game")
                 mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if chosen_mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
