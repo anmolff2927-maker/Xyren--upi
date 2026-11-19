@@ -30,6 +30,7 @@ withdrawal_history = []
 banned_users = set()
 
 active_games = {}
+pending_rw_selections = {}
 active_bj_games = {}
 deposit_states = {}
 withdrawal_states = {}
@@ -54,6 +55,62 @@ VALID_RW_MODES = {
     "2r3w": (2, 3),
     "3r3w": (3, 3),
 }
+
+def rw_mode_keyboard():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "1r1w", "callback_data": "rw_pick_1r1w"},
+                {"text": "2r1w", "callback_data": "rw_pick_2r1w"},
+                {"text": "3r1w", "callback_data": "rw_pick_3r1w"},
+            ],
+            [
+                {"text": "1r2w", "callback_data": "rw_pick_1r2w"},
+                {"text": "2r2w", "callback_data": "rw_pick_2r2w"},
+                {"text": "3r2w", "callback_data": "rw_pick_3r2w"},
+            ],
+            [
+                {"text": "1r3w", "callback_data": "rw_pick_1r3w"},
+                {"text": "2r3w", "callback_data": "rw_pick_2r3w"},
+                {"text": "3r3w", "callback_data": "rw_pick_3r3w"},
+            ],
+        ]
+    }
+
+def start_versus_match(chat_id, user_id, emoji, bet_inr, mode, rw_label):
+    rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
+    user_balances[user_id] -= bet_inr
+    active_games[user_id] = {
+        "bet": bet_inr,
+        "emoji": emoji,
+        "mode": mode,
+        "rw_label": rw_label,
+        "rolls_per_round": rolls_per_round,
+        "target_wins": target_wins,
+        "round_num": 1,
+        "user_wins": 0,
+        "bot_wins": 0,
+        "current_user_rolls": [],
+        "current_bot_rolls": [],
+        "first_turn": None,
+        "step": "selecting_turn"
+    }
+    mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
+                {"text": "👤 You Roll First", "callback_data": "play_user_first"}
+            ]
+        ]
+    }
+    send_message(
+        chat_id,
+        f"🎮 *Game Started* ({emoji} | `{rw_label}` | {mode_title})\n"
+        f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
+        f"💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:",
+        reply_markup=keyboard
+    )
 
 DECK_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 DECK_SUITS = ["♠", "♥", "♦", "♣"]
@@ -701,9 +758,9 @@ def telegram_webhook():
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n\n"
                         "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
-                        "• Modes: `1r1w`, `2r1w`, `3r1w`, `1r2w`, `2r2w`, `3r2w`, `1r3w`, `2r3w`, `3r3w`\n"
+                        "• Pick RW mode via buttons or type `1r1w`–`3r3w`\n"
                         "• Add `crazy` for Lowest Sum Wins!\n"
-                        "• Example: `/dice 50 2r2w` or `/dart 50 3r2w crazy`\n\n"
+                        "• Example: `/dice 50` or `/dart 50 3r2w crazy`\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
@@ -951,7 +1008,7 @@ def telegram_webhook():
                         tokens = text.split()[1:]
                         bet_inr = parse_user_amount("10", user_id)
                         mode = "normal"
-                        rw_label = "1r1w"
+                        rw_label = None
                         invalid_rw = False
                         
                         for tok in tokens:
@@ -976,41 +1033,22 @@ def telegram_webhook():
                             send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                         elif user_balances[user_id] < bet_inr:
                             send_message(chat_id, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
-                        else:
-                            rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
-                            user_balances[user_id] -= bet_inr
-                            active_games[user_id] = {
-                                "bet": bet_inr,
+                        elif rw_label is None:
+                            pending_rw_selections[user_id] = {
+                                "chat_id": chat_id,
                                 "emoji": triggered_game,
-                                "mode": mode,
-                                "rw_label": rw_label,
-                                "rolls_per_round": rolls_per_round,
-                                "target_wins": target_wins,
-                                "round_num": 1,
-                                "user_wins": 0,
-                                "bot_wins": 0,
-                                "current_user_rolls": [],
-                                "current_bot_rolls": [],
-                                "first_turn": None,
-                                "step": "selecting_turn"
+                                "bet": bet_inr,
+                                "mode": mode
                             }
-                            
                             mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [
-                                        {"text": "🤖 Bot Roll First", "callback_data": "play_bot_first"},
-                                        {"text": "👤 You Roll First", "callback_data": "play_user_first"}
-                                    ]
-                                ]
-                            }
                             send_message(
                                 chat_id,
-                                f"🎮 *Game Started* ({triggered_game} | `{rw_label}` | {mode_title})\n"
-                                f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
-                                f"💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:",
-                                reply_markup=keyboard
+                                f"🎯 *Select RW Mode* ({triggered_game} | {mode_title})\n"
+                                f"💰 Bet: {format_money(bet_inr, user_id)}\n\nTap a mode below:",
+                                reply_markup=rw_mode_keyboard()
                             )
+                        else:
+                            start_versus_match(chat_id, user_id, triggered_game, bet_inr, mode, rw_label)
 
         elif 'callback_query' in data:
             query = data['callback_query']
@@ -1029,6 +1067,24 @@ def telegram_webhook():
             if user_id not in user_balances:
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
+
+            if callback_data.startswith("rw_pick_"):
+                chosen_rw = callback_data.replace("rw_pick_", "")
+                if user_id not in pending_rw_selections or chosen_rw not in VALID_RW_MODES:
+                    send_message(chat_id, "⚠️ RW selection expired. Start the game command again.")
+                    return jsonify({'status': 'ok'}), 200
+
+                sel = pending_rw_selections.pop(user_id)
+                target_chat = sel.get("chat_id") or chat_id
+                bet_inr = sel["bet"]
+
+                if bet_inr < MIN_BET or bet_inr > MAX_BET:
+                    send_message(target_chat, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                elif user_balances[user_id] < bet_inr:
+                    send_message(target_chat, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                else:
+                    start_versus_match(target_chat, user_id, sel["emoji"], bet_inr, sel["mode"], chosen_rw)
+                return jsonify({'status': 'ok'}), 200
 
             if callback_data.startswith("bj_"):
                 if user_id not in active_bj_games:
