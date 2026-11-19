@@ -611,6 +611,64 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
     else:
         st["losses"] += 1
 
+
+def format_history_money(amount_in_inr, user_id):
+    curr = user_currency.get(user_id, 'INR')
+    if curr == 'USDT':
+        val = amount_in_inr / EXCHANGE_RATE
+        return f"${val:.2f}"
+    return f"₹{amount_in_inr:.2f}"
+
+def history_page_keyboard(target_uid, page, total_items):
+    total_pages = max(1, (total_items + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "⬅️", "callback_data": f"myhistpg_{target_uid}_{page - 1}"})
+    if page + 1 < total_pages:
+        nav_row.append({"text": "➡️", "callback_data": f"myhistpg_{target_uid}_{page + 1}"})
+    return {"inline_keyboard": [nav_row]} if nav_row else None
+
+def build_user_history_page(user_id, page=0):
+    raw_logs = user_bet_logs.get(user_id, [])
+    logs = list(reversed(raw_logs))
+    total_items = len(logs)
+    total_pages = max(1, (total_items + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * PAGE_SIZE
+    end_idx = start_idx + PAGE_SIZE
+    page_items = logs[start_idx:end_idx]
+
+    if not page_items:
+        return "📜 *Bet History*\n\n_No bets found yet._\n\nPage 1/1", None
+
+    lines = ["📜 *Your Bet History*", ""]
+    for item in page_items:
+        game_title = item.get("game", "Game")
+        gid = item.get("game_id")
+        id_part = f" `#{gid}`" if gid else ""
+        bet_val = float(item.get("bet", 0.0))
+        pnl_val = float(item.get("pnl", 0.0))
+        outcome = str(item.get("outcome", "")).upper()
+        if outcome == "PUSH":
+            payout_val = bet_val
+        elif pnl_val > 0:
+            payout_val = bet_val + pnl_val
+        else:
+            payout_val = 0.0
+
+        t_str = item.get("time", "")
+        lines.append(f"🎲 *{game_title}*{id_part}")
+        lines.append(f"⬆️ Bet *{format_history_money(bet_val, user_id)}*")
+        lines.append(f"⬇️ Payout *{format_history_money(payout_val, user_id)}*")
+        if t_str:
+            lines.append(f"🕒 `{t_str}`")
+        lines.append("")
+
+    lines.append(f"Page {page + 1}/{total_pages}")
+    return "\n".join(lines).strip(), history_page_keyboard(user_id, page, total_items)
+
 def info_menu_keyboard(target_uid):
     return {
         "inline_keyboard": [
@@ -1720,6 +1778,7 @@ def telegram_webhook():
                         "- `/hb` - Check House Balance\n"
                         "- `/currency` - Change currency (INR / USDT)\n"
                         "- `/stats` - View your visual stats card\n"
+                        "- `/history` - View your bet history (5 per page)\n"
                         "- `/deposit` - Add money via ZapUPI (DM Only)\n"
                         "- `/withdraw` - Withdraw your winnings (DM Only)\n"
                         "- `/tip <amount> <username>` or reply `/tip <amount>` - Send tip\n"
@@ -1737,6 +1796,11 @@ def telegram_webhook():
 
                 elif re.match(rf"^/hb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
                     send_message(chat_id, f"🏦 *House Balance:* *{format_money(HOUSE_BALANCE, user_id)}*")
+
+                elif re.match(rf"^/(?:history|mybets)(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
+                    hist_text, hist_kb = build_user_history_page(user_id, page=0)
+                    send_message(chat_id, hist_text, reply_markup=hist_kb)
+                    return jsonify({'status': 'ok'}), 200
 
                 elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id in active_bj_games:
@@ -2097,7 +2161,7 @@ def telegram_webhook():
             
             answer_callback(callback_query_id)
             
-            if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_") and not callback_data.startswith("infopg_"):
+            if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_") and not callback_data.startswith("infopg_") and not callback_data.startswith("myhistpg_"):
                 remove_inline_keyboard(chat_id, message_id)
             
             register_user_identity(query.get('from'))
@@ -2114,6 +2178,20 @@ def telegram_webhook():
                     edit_message(chat_id, message_id, sec_text, reply_markup=sec_kb)
                 except Exception as e:
                     print(f"Info pagination error: {e}")
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data.startswith("myhistpg_"):
+                try:
+                    _, raw_uid, raw_page = callback_data.split("_", 2)
+                    target_uid = int(raw_uid)
+                    page = int(raw_page)
+                    if user_id != target_uid and user_id not in admin_list:
+                        answer_callback(callback_query_id, "This history belongs to another player.")
+                        return jsonify({'status': 'ok'}), 200
+                    hist_text, hist_kb = build_user_history_page(target_uid, page=page)
+                    edit_message(chat_id, message_id, hist_text, reply_markup=hist_kb)
+                except Exception as e:
+                    print(f"History pagination error: {e}")
                 return jsonify({'status': 'ok'}), 200
 
             if callback_data == "gs_cancel":
