@@ -3,6 +3,7 @@ import time
 import random
 import io
 import re
+import uuid
 import requests
 from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
@@ -31,6 +32,9 @@ banned_users = set()
 
 active_games = {}
 pending_rw_selections = {}
+pending_match_confirmations = {}
+open_pvp_challenges = {}
+active_pvp_games = {}
 active_bj_games = {}
 deposit_states = {}
 withdrawal_states = {}
@@ -56,6 +60,14 @@ VALID_RW_MODES = {
     "3r3w": (3, 3),
 }
 
+GAME_NAME_MAP = {
+    "🎲": "Dice",
+    "🎯": "Dart",
+    "⚽": "Football",
+    "🏀": "Basketball",
+    "🎳": "Bowling",
+}
+
 def rw_mode_keyboard():
     return {
         "inline_keyboard": [
@@ -73,6 +85,22 @@ def rw_mode_keyboard():
                 {"text": "1r3w", "callback_data": "rw_pick_1r3w"},
                 {"text": "2r3w", "callback_data": "rw_pick_2r3w"},
                 {"text": "3r3w", "callback_data": "rw_pick_3r3w"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "rw_cancel"},
+            ],
+        ]
+    }
+
+def match_confirm_keyboard():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🤖 Against Bot", "callback_data": "mc_bot"},
+                {"text": "👥 Against Player", "callback_data": "mc_player"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "mc_cancel"},
             ],
         ]
     }
@@ -110,6 +138,90 @@ def start_versus_match(chat_id, user_id, emoji, bet_inr, mode, rw_label):
         f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
         f"💰 Bet: {format_money(bet_inr, user_id)}\n\nChoose who rolls first:",
         reply_markup=keyboard
+    )
+
+def resolve_pvp_round_and_match(chat_id, match_id, pvm):
+    global HOUSE_BALANCE
+    emoji = pvm["emoji"]
+    mode = pvm["mode"]
+    rw_label = pvm["rw_label"]
+    target_wins = pvm["target_wins"]
+    bet = pvm["bet"]
+    p1 = pvm["p1_id"]
+    p2 = pvm["p2_id"]
+
+    r1_vals = pvm["p1_rolls"]
+    r2_vals = pvm["p2_rolls"]
+    s1 = sum(r1_vals)
+    s2 = sum(r2_vals)
+
+    expr1 = "+".join(map(str, r1_vals))
+    expr2 = "+".join(map(str, r2_vals))
+    round_num = pvm["round_num"]
+    mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
+
+    if s1 == s2:
+        r_status = "🤝 *Round Tied!* No point awarded."
+    elif mode == "crazy":
+        if s1 < s2:
+            pvm["p1_wins"] += 1
+            r_status = f"🎉 *Player 1 (`{p1}`)* wins this round! (Lower sum wins)"
+        else:
+            pvm["p2_wins"] += 1
+            r_status = f"🎉 *Player 2 (`{p2}`)* wins this round! (Lower sum wins)"
+    else:
+        if s1 > s2:
+            pvm["p1_wins"] += 1
+            r_status = f"🎉 *Player 1 (`{p1}`)* wins this round! (Higher sum wins)"
+        else:
+            pvm["p2_wins"] += 1
+            r_status = f"🎉 *Player 2 (`{p2}`)* wins this round! (Higher sum wins)"
+
+    msg = (
+        f"⚔️ *PvP Round {round_num}* ({emoji} | `{rw_label}` | {mode_tag})\n"
+        f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
+        f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n"
+        f"{r_status}\n"
+        f"🏆 Points — P1: *{pvm['p1_wins']}* | P2: *{pvm['p2_wins']}* (First to *{target_wins}*)"
+    )
+    send_message(chat_id, msg)
+
+    if pvm["p1_wins"] >= target_wins or pvm["p2_wins"] >= target_wins:
+        winner_id = p1 if pvm["p1_wins"] >= target_wins else p2
+        loser_id = p2 if winner_id == p1 else p1
+
+        total_pot = bet * 2
+        payout = total_pot * 0.97
+        house_fee = total_pot - payout
+        HOUSE_BALANCE += house_fee
+
+        user_balances[winner_id] += payout
+        update_user_stats(winner_id, emoji, bet, payout - bet, True)
+        update_user_stats(loser_id, emoji, bet, -bet, False)
+
+        final_text = (
+            f"🏁 *PvP Match Over ({emoji} | `{rw_label}`)*\n\n"
+            f"👑 *Winner:* `{winner_id}`\n"
+            f"💰 *Payout:* *{format_money(payout, winner_id)}*\n"
+            f"📊 *Final Points:* P1 (`{p1}`): *{pvm['p1_wins']}* — P2 (`{p2}`): *{pvm['p2_wins']}*\n"
+            f"💳 Winner Balance: {format_money(user_balances[winner_id], winner_id)}"
+        )
+        send_message(chat_id, final_text)
+
+        active_pvp_games.pop(match_id, None)
+        if active_games.get(p1) == match_id:
+            active_games.pop(p1, None)
+        if active_games.get(p2) == match_id:
+            active_games.pop(p2, None)
+        return
+
+    pvm["round_num"] += 1
+    pvm["p1_rolls"] = []
+    pvm["p2_rolls"] = []
+    pvm["turn"] = p1
+    send_message(
+        chat_id,
+        f"➡️ *Round {pvm['round_num']}* — Player 1 (`{p1}`), send `{emoji}` x{pvm['rolls_per_round']} in chat!"
     )
 
 DECK_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
@@ -700,9 +812,37 @@ def telegram_webhook():
                 return jsonify({'status': 'ok'}), 200
 
             if 'dice' in message and user_id in active_games:
-                game = active_games[user_id]
-                expected_emoji = game['emoji']
+                active_ref = active_games[user_id]
                 user_dice = message['dice']
+
+                if isinstance(active_ref, str) and active_ref in active_pvp_games:
+                    pvm = active_pvp_games[active_ref]
+                    if pvm["chat_id"] != chat_id or pvm["turn"] != user_id:
+                        return jsonify({'status': 'ok'}), 200
+                    if user_dice.get('emoji') != pvm["emoji"]:
+                        return jsonify({'status': 'ok'}), 200
+
+                    val = user_dice.get('value', 1)
+                    needed = pvm["rolls_per_round"]
+                    is_p1 = (user_id == pvm["p1_id"])
+                    roll_list = pvm["p1_rolls"] if is_p1 else pvm["p2_rolls"]
+                    roll_list.append(val)
+
+                    rem = needed - len(roll_list)
+                    if rem > 0:
+                        send_message(chat_id, f"🎲 Player `{user_id}` Roll `{len(roll_list)}/{needed}`: *{val}* — Send `{rem}` more `{pvm['emoji']}`!")
+                        return jsonify({'status': 'ok'}), 200
+
+                    if is_p1:
+                        expr = "+".join(map(str, roll_list))
+                        send_message(chat_id, f"👤 P1 (`{pvm['p1_id']}`) Rolls: `{expr}` (*{sum(roll_list)}*)\n\n👉 *Player 2 (`{pvm['p2_id']}`), your turn! Send `{pvm['emoji']}` x{needed}.*")
+                        pvm["turn"] = pvm["p2_id"]
+                    else:
+                        resolve_pvp_round_and_match(chat_id, active_ref, pvm)
+                    return jsonify({'status': 'ok'}), 200
+
+                game = active_ref
+                expected_emoji = game['emoji']
                 
                 if user_dice.get('emoji') == expected_emoji and game['step'] in ['waiting_user_first', 'waiting_user_second']:
                     user_val = user_dice.get('value', 1)
@@ -760,6 +900,7 @@ def telegram_webhook():
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "• Pick RW mode via buttons or type `1r1w`–`3r3w`\n"
                         "• Add `crazy` for Lowest Sum Wins!\n"
+                        "• Choose *Against Bot* or *Against Player* after mode selection\n"
                         "• Example: `/dice 50` or `/dart 50 3r2w crazy`\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
@@ -1048,7 +1189,24 @@ def telegram_webhook():
                                 reply_markup=rw_mode_keyboard()
                             )
                         else:
-                            start_versus_match(chat_id, user_id, triggered_game, bet_inr, mode, rw_label)
+                            pending_match_confirmations[user_id] = {
+                                "chat_id": chat_id,
+                                "emoji": triggered_game,
+                                "bet": bet_inr,
+                                "mode": mode,
+                                "rw_label": rw_label
+                            }
+                            mode_label = "CRAZY (Lowest Sum Wins)" if mode == "crazy" else "NORMAL (Highest Sum Wins)"
+                            g_name = GAME_NAME_MAP.get(triggered_game, "Game")
+                            conf_msg = (
+                                "📋 *Match Confirmation*\n\n"
+                                f"🎮 *Game:* {g_name} ({triggered_game})\n"
+                                f"⚙️ *Mode:* *{mode_label}*\n"
+                                f"🏆 *RW Format:* `{rw_label}`\n"
+                                f"💰 *Bet Amount:* *{format_money(bet_inr, user_id)}*\n\n"
+                                "Choose how you want to play:"
+                            )
+                            send_message(chat_id, conf_msg, reply_markup=match_confirm_keyboard())
 
         elif 'callback_query' in data:
             query = data['callback_query']
@@ -1068,6 +1226,11 @@ def telegram_webhook():
                 user_balances[user_id] = 0.0
                 user_currency[user_id] = 'INR'
 
+            if callback_data == "rw_cancel":
+                pending_rw_selections.pop(user_id, None)
+                send_message(chat_id, "❌ Mode selection cancelled.")
+                return jsonify({'status': 'ok'}), 200
+
             if callback_data.startswith("rw_pick_"):
                 chosen_rw = callback_data.replace("rw_pick_", "")
                 if user_id not in pending_rw_selections or chosen_rw not in VALID_RW_MODES:
@@ -1077,13 +1240,173 @@ def telegram_webhook():
                 sel = pending_rw_selections.pop(user_id)
                 target_chat = sel.get("chat_id") or chat_id
                 bet_inr = sel["bet"]
+                mode = sel["mode"]
+                emoji = sel["emoji"]
 
                 if bet_inr < MIN_BET or bet_inr > MAX_BET:
                     send_message(target_chat, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
                 elif user_balances[user_id] < bet_inr:
                     send_message(target_chat, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
                 else:
-                    start_versus_match(target_chat, user_id, sel["emoji"], bet_inr, sel["mode"], chosen_rw)
+                    pending_match_confirmations[user_id] = {
+                        "chat_id": target_chat,
+                        "emoji": emoji,
+                        "bet": bet_inr,
+                        "mode": mode,
+                        "rw_label": chosen_rw
+                    }
+                    mode_label = "CRAZY (Lowest Sum Wins)" if mode == "crazy" else "NORMAL (Highest Sum Wins)"
+                    g_name = GAME_NAME_MAP.get(emoji, "Game")
+                    conf_msg = (
+                        "📋 *Match Confirmation*\n\n"
+                        f"🎮 *Game:* {g_name} ({emoji})\n"
+                        f"⚙️ *Mode:* *{mode_label}*\n"
+                        f"🏆 *RW Format:* `{chosen_rw}`\n"
+                        f"💰 *Bet Amount:* *{format_money(bet_inr, user_id)}*\n\n"
+                        "Choose how you want to play:"
+                    )
+                    send_message(target_chat, conf_msg, reply_markup=match_confirm_keyboard())
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data == "mc_cancel":
+                pending_match_confirmations.pop(user_id, None)
+                for cid, ch in list(open_pvp_challenges.items()):
+                    if ch["host_id"] == user_id:
+                        open_pvp_challenges.pop(cid, None)
+                send_message(chat_id, "❌ Match cancelled.")
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data == "mc_bot":
+                if user_id not in pending_match_confirmations:
+                    send_message(chat_id, "⚠️ Confirmation expired. Start a new game command.")
+                    return jsonify({'status': 'ok'}), 200
+                conf = pending_match_confirmations.pop(user_id)
+                target_chat = conf.get("chat_id") or chat_id
+                bet_inr = conf["bet"]
+                if bet_inr < MIN_BET or bet_inr > MAX_BET:
+                    send_message(target_chat, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                elif user_balances[user_id] < bet_inr:
+                    send_message(target_chat, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                else:
+                    start_versus_match(target_chat, user_id, conf["emoji"], bet_inr, conf["mode"], conf["rw_label"])
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data == "mc_player":
+                if user_id not in pending_match_confirmations:
+                    send_message(chat_id, "⚠️ Confirmation expired. Start a new game command.")
+                    return jsonify({'status': 'ok'}), 200
+                conf = pending_match_confirmations.pop(user_id)
+                target_chat = conf.get("chat_id") or chat_id
+                bet_inr = conf["bet"]
+                if bet_inr < MIN_BET or bet_inr > MAX_BET:
+                    send_message(target_chat, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                    return jsonify({'status': 'ok'}), 200
+                if user_balances[user_id] < bet_inr:
+                    send_message(target_chat, f"❌ Insufficient balance! Please open Bot DM to deposit: https://t.me/{BOT_USERNAME.replace('@','')}")
+                    return jsonify({'status': 'ok'}), 200
+
+                challenge_id = uuid.uuid4().hex[:8]
+                rolls_per_round, target_wins = VALID_RW_MODES[conf["rw_label"]]
+                mode_label = "CRAZY (Lowest Sum Wins)" if conf["mode"] == "crazy" else "NORMAL (Highest Sum Wins)"
+                g_name = GAME_NAME_MAP.get(conf["emoji"], "Game")
+
+                open_pvp_challenges[challenge_id] = {
+                    "chat_id": target_chat,
+                    "host_id": user_id,
+                    "emoji": conf["emoji"],
+                    "bet": bet_inr,
+                    "mode": conf["mode"],
+                    "rw_label": conf["rw_label"],
+                    "rolls_per_round": rolls_per_round,
+                    "target_wins": target_wins,
+                }
+                invite_msg = (
+                    "⚔️ *Player vs Player Challenge!*\n\n"
+                    f"👤 *Challenger:* `{user_id}`\n"
+                    f"🎮 *Game:* {g_name} ({conf['emoji']})\n"
+                    f"⚙️ *Mode:* *{mode_label}*\n"
+                    f"🏆 *RW Format:* `{conf['rw_label']}` (First to *{target_wins}*)\n"
+                    f"💰 *Bet Each:* *{format_money(bet_inr, user_id)}*\n\n"
+                    "Tap *Accept* to start:"
+                )
+                kb = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "✅ Accept Challenge", "callback_data": f"pvp_acc_{challenge_id}"},
+                            {"text": "❌ Cancel", "callback_data": f"pvp_can_{challenge_id}"}
+                        ]
+                    ]
+                }
+                send_message(target_chat, invite_msg, reply_markup=kb)
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data.startswith("pvp_can_"):
+                cid = callback_data.replace("pvp_can_", "")
+                ch = open_pvp_challenges.get(cid)
+                if not ch:
+                    send_message(chat_id, "⚠️ Challenge already closed or expired.")
+                    return jsonify({'status': 'ok'}), 200
+                if user_id != ch["host_id"] and user_id not in admin_list:
+                    answer_callback(callback_query_id, "Only challenger can cancel!")
+                    return jsonify({'status': 'ok'}), 200
+                open_pvp_challenges.pop(cid, None)
+                send_message(ch["chat_id"], f"❌ PvP Challenge `{cid}` cancelled.")
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data.startswith("pvp_acc_"):
+                cid = callback_data.replace("pvp_acc_", "")
+                ch = open_pvp_challenges.get(cid)
+                if not ch:
+                    send_message(chat_id, "⚠️ Challenge already accepted or expired.")
+                    return jsonify({'status': 'ok'}), 200
+
+                host_id = ch["host_id"]
+                if user_id == host_id:
+                    answer_callback(callback_query_id, "You cannot accept your own challenge!")
+                    return jsonify({'status': 'ok'}), 200
+
+                bet_inr = ch["bet"]
+                if user_balances.get(host_id, 0.0) < bet_inr:
+                    open_pvp_challenges.pop(cid, None)
+                    send_message(ch["chat_id"], "❌ Challenger has insufficient balance. Challenge cancelled.")
+                    return jsonify({'status': 'ok'}), 200
+
+                if user_balances.get(user_id, 0.0) < bet_inr:
+                    send_message(ch["chat_id"], f"❌ User `{user_id}` has insufficient balance to accept ({format_money(bet_inr, user_id)} needed).")
+                    return jsonify({'status': 'ok'}), 200
+
+                open_pvp_challenges.pop(cid, None)
+                user_balances[host_id] -= bet_inr
+                user_balances[user_id] -= bet_inr
+
+                match_id = f"pvp_{cid}"
+                active_pvp_games[match_id] = {
+                    "chat_id": ch["chat_id"],
+                    "p1_id": host_id,
+                    "p2_id": user_id,
+                    "emoji": ch["emoji"],
+                    "bet": bet_inr,
+                    "mode": ch["mode"],
+                    "rw_label": ch["rw_label"],
+                    "rolls_per_round": ch["rolls_per_round"],
+                    "target_wins": ch["target_wins"],
+                    "round_num": 1,
+                    "p1_wins": 0,
+                    "p2_wins": 0,
+                    "p1_rolls": [],
+                    "p2_rolls": [],
+                    "turn": host_id,
+                }
+                active_games[host_id] = match_id
+                active_games[user_id] = match_id
+
+                send_message(
+                    ch["chat_id"],
+                    f"🎮 *PvP Match Started!* ({ch['emoji']} | `{ch['rw_label']}`)\n"
+                    f"👤 P1: `{host_id}` vs P2: `{user_id}` | Bet: *{format_money(bet_inr, user_id)}*\n"
+                    f"🎯 First to *{ch['target_wins']}* round win(s) | *{ch['rolls_per_round']}* roll(s)/round\n\n"
+                    f"👉 *Round 1 — Player 1 (`{host_id}`), send `{ch['emoji']}` x{ch['rolls_per_round']} in chat!*"
+                )
                 return jsonify({'status': 'ok'}), 200
 
             if callback_data.startswith("bj_"):
@@ -1302,7 +1625,7 @@ def telegram_webhook():
                     send_message(chat_id, "⛔ Unauthorized.")
                 
             elif callback_data in ["play_user_first", "play_bot_first"]:
-                if user_id not in active_games:
+                if user_id not in active_games or isinstance(active_games[user_id], str):
                     send_message(chat_id, "⚠️ Session expired. Start a new game.")
                     return jsonify({'status': 'ok'}), 200
                     
