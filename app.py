@@ -393,7 +393,8 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         label = f"PvP {g_name} ({rw_label}/{mode})"
         record_user_bet(winner_id, label, bet, win_pnl, "WON", game_id=gid)
         record_user_bet(loser_id, label, bet, -bet, "LOST", game_id=gid)
-        mark_game_finished(gid, "completed", extra_meta={"winner_id": winner_id, "payout": payout})
+        win_actor = format_win_actor(winner_id)
+        mark_game_finished(gid, "completed", extra_meta={"winner_id": winner_id, "winner_label": win_actor, "payout": payout})
         log_win_to_channel(winner_id, emoji, f"PvP {g_name}", payout, fmt_mult(mult))
 
         final_text = (
@@ -748,10 +749,26 @@ def build_game_search_report(target_gid):
         p2 = meta.get("p2_id")
         lines.append(f"• *Players:* P1 `{p1}` vs P2 `{p2}`")
         lines.append(f"• *Bet Each:* *{format_money(bet_inr, owner_id)}*")
-        if meta.get("winner_id"):
-            lines.append(f"• *Winner:* `{meta['winner_id']}`")
+        if status_str == "COMPLETED":
+            if meta.get("winner_id"):
+                w_lbl = f" ({meta['winner_label']})" if meta.get("winner_label") else ""
+                lines.append(f"• *Winner:* `{meta['winner_id']}`{w_lbl}")
+            else:
+                lines.append("• *Winner:* _N/A_")
+    elif rec.get("kind") == "bot_versus":
+        lines.append(f"• *Bet Amount:* *{format_money(bet_inr, owner_id)}*")
+        if status_str == "COMPLETED":
+            w_id = meta.get("winner_id")
+            w_lbl = meta.get("winner_label")
+            if w_id is not None:
+                lbl_part = f" ({w_lbl})" if w_lbl else ""
+                lines.append(f"• *Winner:* `{w_id}`{lbl_part}")
+            else:
+                lines.append("• *Winner:* _N/A_")
     else:
         lines.append(f"• *Bet Amount:* *{format_money(bet_inr, owner_id)}*")
+        if status_str == "COMPLETED" and meta.get("outcome"):
+            lines.append(f"• *Outcome:* *{meta['outcome']}*")
 
     if meta.get("emoji"):
         g_name = GAME_NAME_MAP.get(meta["emoji"], "Game")
@@ -974,7 +991,16 @@ def resolve_round_and_match(chat_id, user_id, game):
             HOUSE_BALANCE -= profit_inr
             update_user_stats(user_id, emoji, bet, profit_inr, True)
             record_user_bet(user_id, label, bet, profit_inr, "WON", game_id=gid)
-            mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
+            mark_game_finished(
+                gid,
+                "completed",
+                extra_meta={
+                    "outcome": "WON",
+                    "winner_id": user_id,
+                    "winner_label": format_win_actor(user_id),
+                    "pnl": profit_inr
+                }
+            )
             log_win_to_channel(user_id, emoji, g_name, win_amt, fmt_mult(mult))
             final_text = (
                 f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
@@ -988,7 +1014,16 @@ def resolve_round_and_match(chat_id, user_id, game):
             HOUSE_BALANCE += bet
             update_user_stats(user_id, emoji, bet, profit_inr, False)
             record_user_bet(user_id, label, bet, profit_inr, "LOST", game_id=gid)
-            mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
+            mark_game_finished(
+                gid,
+                "completed",
+                extra_meta={
+                    "outcome": "LOST",
+                    "winner_id": "Bot",
+                    "winner_label": "Bot",
+                    "pnl": profit_inr
+                }
+            )
             final_text = (
                 f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
@@ -1070,79 +1105,97 @@ def telegram_webhook():
                 if action == 'add_bal':
                     try:
                         parts = text.split(' ')
-                        t_user = int(parts[0])
+                        t_user = resolve_user_identifier(parts[0])
+                        if t_user is None:
+                            raise ValueError()
                         amt = parse_user_amount(parts[1], t_user)
+                        if amt is None or amt <= 0:
+                            raise ValueError()
                         if t_user not in user_balances: user_balances[t_user] = 0.0
                         user_balances[t_user] += amt
                         send_message(chat_id, f"✅ Added {format_money(amt, t_user)} to user `{t_user}`.")
                         send_message(t_user, f"💰 *Admin credited your account!* +{format_money(amt, t_user)}")
                     except:
-                        send_message(chat_id, "⚠️ Invalid format. Use: `<user_id> <amount>`")
+                        send_message(chat_id, "⚠️ Invalid format. Use: `<user_id/@username> <amount>`")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
                 elif action == 'deduct_bal':
                     try:
                         parts = text.split(' ')
-                        t_user = int(parts[0])
+                        t_user = resolve_user_identifier(parts[0])
+                        if t_user is None:
+                            raise ValueError()
                         amt = parse_user_amount(parts[1], t_user)
+                        if amt is None or amt <= 0:
+                            raise ValueError()
                         if t_user in user_balances:
                             user_balances[t_user] = max(0.0, user_balances[t_user] - amt)
                             send_message(chat_id, f"✅ Deducted {format_money(amt, t_user)} from user `{t_user}`.")
                             send_message(t_user, f"⚠️ *Admin deducted from your account.* -{format_money(amt, t_user)}")
                     except:
-                        send_message(chat_id, "⚠️ Invalid format. Use: `<user_id> <amount>`")
+                        send_message(chat_id, "⚠️ Invalid format. Use: `<user_id/@username> <amount>`")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
                 elif action == 'user_stats':
                     try:
-                        target_u = int(text)
+                        target_u = resolve_user_identifier(text)
+                        if target_u is None:
+                            raise ValueError()
                         bio = generate_stats_image(target_u)
                         send_photo(chat_id, bio, caption=f"📊 Stats for User `{target_u}`")
                     except:
-                        send_message(chat_id, "⚠️ Invalid User ID.")
+                        send_message(chat_id, "⚠️ Invalid User ID or Username.")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
                 elif action == 'ban_user':
                     try:
-                        target_u = int(text)
+                        target_u = resolve_user_identifier(text)
+                        if target_u is None:
+                            raise ValueError()
                         banned_users.add(target_u)
                         send_message(chat_id, f"🚫 User `{target_u}` has been BANNED.")
                     except:
-                        send_message(chat_id, "⚠️ Invalid User ID.")
+                        send_message(chat_id, "⚠️ Invalid User ID or Username.")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
                 elif action == 'unban_user':
                     try:
-                        target_u = int(text)
+                        target_u = resolve_user_identifier(text)
+                        if target_u is None:
+                            raise ValueError()
                         if target_u in banned_users: banned_users.remove(target_u)
                         send_message(chat_id, f"✅ User `{target_u}` has been UNBANNED.")
                     except:
-                        send_message(chat_id, "⚠️ Invalid User ID.")
+                        send_message(chat_id, "⚠️ Invalid User ID or Username.")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
                 elif action == 'grant_admin':
                     try:
-                        target_u = int(text)
+                        target_u = resolve_user_identifier(text)
+                        if target_u is None:
+                            raise ValueError()
                         admin_list.add(target_u)
                         send_message(chat_id, f"👑 User `{target_u}` granted Admin rights.")
                     except:
-                        send_message(chat_id, "⚠️ Invalid User ID.")
+                        send_message(chat_id, "⚠️ Invalid User ID or Username.")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
                 elif action == 'revoke_admin':
                     try:
-                        target_u = int(text)
+                        target_u = resolve_user_identifier(text)
+                        if target_u is None:
+                            raise ValueError()
                         if target_u != ADMIN_USER_ID and target_u in admin_list:
                             admin_list.remove(target_u)
                             send_message(chat_id, f"⛔ Admin rights revoked for `{target_u}`.")
                     except:
-                        send_message(chat_id, "⚠️ Invalid User ID.")
+                        send_message(chat_id, "⚠️ Invalid User ID or Username.")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
                     
@@ -1158,12 +1211,14 @@ def telegram_webhook():
                 elif action == 'broadcast_private':
                     try:
                         parts = text.split(' ', 1)
-                        target_u = int(parts[0])
+                        target_u = resolve_user_identifier(parts[0])
+                        if target_u is None:
+                            raise ValueError()
                         msg = parts[1]
                         send_message(target_u, f"📢 *Admin Message*\n\n{msg}")
                         send_message(chat_id, f"✅ Private message sent to `{target_u}`.")
                     except:
-                        send_message(chat_id, "⚠️ Format error. Use: `<user_id> <message>`")
+                        send_message(chat_id, "⚠️ Format error. Use: `<user_id/@username> <message>`")
                     del admin_states[user_id]
                     return jsonify({'status': 'ok'}), 200
 
@@ -1315,6 +1370,124 @@ def telegram_webhook():
 
             if 'text' in message:
                 text = message['text'].strip()
+
+                if re.match(rf"^/sethb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, f"🏦 Current House Balance: *{format_money(HOUSE_BALANCE, user_id)}*\nUsage: `/sethb <amount>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        val = float(parts[1])
+                        if val < 0:
+                            raise ValueError()
+                        HOUSE_BALANCE = val
+                        send_message(chat_id, f"✅ House Balance set to *{format_money(HOUSE_BALANCE, user_id)}*.")
+                    except ValueError:
+                        send_message(chat_id, "⚠️ Enter a valid non-negative amount (e.g. `/sethb 150000`).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/deducthb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, f"🏦 Current House Balance: *{format_money(HOUSE_BALANCE, user_id)}*\nUsage: `/deducthb <amount>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        amt = float(parts[1])
+                        if amt <= 0:
+                            raise ValueError()
+                        HOUSE_BALANCE = max(0.0, HOUSE_BALANCE - amt)
+                        send_message(chat_id, f"✅ Deducted *{format_money(amt, user_id)}* from House Balance.\n🏦 New House Balance: *{format_money(HOUSE_BALANCE, user_id)}*")
+                    except ValueError:
+                        send_message(chat_id, "⚠️ Enter a valid positive amount (e.g. `/deducthb 5000`).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/minbet(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, f"🎯 Current Min Bet: *{format_money(MIN_BET, user_id)}*\nUsage: `/minbet <amount>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        val = float(parts[1])
+                        if val <= 0 or val > MAX_BET:
+                            raise ValueError()
+                        MIN_BET = val
+                        send_message(chat_id, f"✅ Min Bet updated to *{format_money(MIN_BET, user_id)}*.")
+                    except ValueError:
+                        send_message(chat_id, f"⚠️ Enter a valid amount `> 0` and `<= MAX_BET` (`{MAX_BET}`).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/maxbet(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message(chat_id, f"🎯 Current Max Bet: *{format_money(MAX_BET, user_id)}*\nUsage: `/maxbet <amount>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        val = float(parts[1])
+                        if val <= 0 or val < MIN_BET:
+                            raise ValueError()
+                        MAX_BET = val
+                        send_message(chat_id, f"✅ Max Bet updated to *{format_money(MAX_BET, user_id)}*.")
+                    except ValueError:
+                        send_message(chat_id, f"⚠️ Enter a valid amount `>= MIN_BET` (`{MIN_BET}`).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/addbalance(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 3:
+                        send_message(chat_id, "⚠️ Usage: `/addbalance <user_id/@username> <amount>`")
+                        return jsonify({'status': 'ok'}), 200
+                    target_uid = resolve_user_identifier(parts[1])
+                    if target_uid is None:
+                        send_message(chat_id, f"⚠️ User `{parts[1]}` not found.")
+                        return jsonify({'status': 'ok'}), 200
+                    amt_inr = parse_user_amount(parts[2], target_uid)
+                    if amt_inr is None or amt_inr <= 0:
+                        send_message(chat_id, "⚠️ Enter a valid positive amount.")
+                        return jsonify({'status': 'ok'}), 200
+                    if target_uid not in user_balances:
+                        user_balances[target_uid] = 0.0
+                        user_currency[target_uid] = 'INR'
+                    user_balances[target_uid] += amt_inr
+                    send_message(chat_id, f"✅ Added *{format_money(amt_inr, target_uid)}* to `{target_uid}`.\n💰 New Balance: *{format_money(user_balances[target_uid], target_uid)}*")
+                    send_message(target_uid, f"💰 *Admin credited your account!* +{format_money(amt_inr, target_uid)}")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/deductbalance(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 3:
+                        send_message(chat_id, "⚠️ Usage: `/deductbalance <user_id/@username> <amount>`")
+                        return jsonify({'status': 'ok'}), 200
+                    target_uid = resolve_user_identifier(parts[1])
+                    if target_uid is None:
+                        send_message(chat_id, f"⚠️ User `{parts[1]}` not found.")
+                        return jsonify({'status': 'ok'}), 200
+                    amt_inr = parse_user_amount(parts[2], target_uid)
+                    if amt_inr is None or amt_inr <= 0:
+                        send_message(chat_id, "⚠️ Enter a valid positive amount.")
+                        return jsonify({'status': 'ok'}), 200
+                    cur_b = user_balances.get(target_uid, 0.0)
+                    user_balances[target_uid] = max(0.0, cur_b - amt_inr)
+                    send_message(chat_id, f"✅ Deducted *{format_money(amt_inr, target_uid)}* from `{target_uid}`.\n💰 New Balance: *{format_money(user_balances[target_uid], target_uid)}*")
+                    send_message(target_uid, f"⚠️ *Admin deducted from your account.* -{format_money(amt_inr, target_uid)}")
+                    return jsonify({'status': 'ok'}), 200
 
                 mult_cmd_map = {
                     "/setmultidice": "dice",
