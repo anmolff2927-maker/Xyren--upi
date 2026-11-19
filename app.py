@@ -463,6 +463,14 @@ def normalize_channel_id(raw_id):
         return int(f"-100{s}")
     return s
 
+def format_user_mention(user_id):
+    uname = user_usernames.get(user_id)
+    if uname:
+        return f"@{uname}"
+    fname = user_first_names.get(user_id) or f"User {user_id}"
+    safe_name = str(fname).replace("[", "").replace("]", "")
+    return f"[{safe_name}](tg://user?id={user_id})"
+
 def format_win_actor(user_id):
     if user_id in user_usernames and user_usernames[user_id]:
         return f"@{user_usernames[user_id]}"
@@ -637,7 +645,7 @@ def build_match_confirmation_text(user_id, emoji, bet_inr, mode, rw_label, game_
         "Choose how you want to play:"
     )
 
-def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_label, game_id=None):
+def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_label, game_id=None, trigger_msg_id=None):
     gid = game_id or generate_game_id()
     rolls_per_round, target_wins = VALID_RW_MODES[rw_label]
     user_balances[user_id] = user_balances.get(user_id, 0.0) - bet_inr
@@ -647,10 +655,11 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         "bot_versus",
         user_id,
         bet_inr,
-        meta={"chat_id": chat_id, "emoji": emoji, "mode": mode, "rw_label": rw_label},
+        meta={"chat_id": chat_id, "emoji": emoji, "mode": mode, "rw_label": rw_label, "trigger_msg_id": trigger_msg_id},
         refund_on_cancel=True
     )
     mode_title = "🔥 CRAZY MODE (Lowest Sum Wins)" if mode == "crazy" else "⚡ NORMAL MODE (Highest Sum Wins)"
+    player_tag = format_user_mention(user_id)
     keyboard = {
         "inline_keyboard": [
             [
@@ -660,8 +669,9 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
     }
     text = (
         f"🎮 *Game Started* (`{gid}` | {emoji} | `{rw_label}` | {mode_title})\n"
+        f"👤 Player: {player_tag}\n"
         f"🎯 First to *{target_wins}* round win(s) | *{rolls_per_round}* roll(s)/round\n"
-        f"💰 Bet: {format_money(bet_inr, user_id)}\n\nSend {emoji} x{rolls_per_round}"
+        f"💰 Bet: {format_money(bet_inr, user_id)}\n\n{player_tag}, send {emoji} x{rolls_per_round}"
     )
     sent_msg_id = message_id
     if message_id:
@@ -687,7 +697,8 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         "first_turn": None,
         "step": "selecting_turn",
         "start_chat_id": chat_id,
-        "start_message_id": sent_msg_id
+        "start_message_id": sent_msg_id,
+        "trigger_msg_id": trigger_msg_id
     }
 
 def resolve_pvp_round_and_match(chat_id, match_id, pvm):
@@ -842,11 +853,13 @@ def parse_user_amount(text_val, user_id):
     except:
         return None
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     url = f"{TELEGRAM_API_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
     try:
         res = requests.post(url, json=payload, timeout=5)
         return res.json()
@@ -1307,9 +1320,11 @@ def play_dealer_and_settle(chat_id, message_id, user_id, bj):
     else:
         finish_bj_game(chat_id, message_id, user_id, bj, "push")
 
-def send_animated_game(chat_id, emoji):
+def send_animated_game(chat_id, emoji, reply_to_message_id=None):
     url = f"{TELEGRAM_API_URL}/sendDice"
     payload = {"chat_id": chat_id, "emoji": emoji}
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
     try:
         res = requests.post(url, json=payload, timeout=5)
         return res.json()
@@ -1317,10 +1332,10 @@ def send_animated_game(chat_id, emoji):
         print(f"Error sending game: {e}")
         return None
 
-def roll_bot_series(chat_id, emoji, rolls_count):
+def roll_bot_series(chat_id, emoji, rolls_count, reply_to_message_id=None):
     vals = []
-    for _ in range(rolls_count):
-        res = send_animated_game(chat_id, emoji)
+    for idx in range(rolls_count):
+        res = send_animated_game(chat_id, emoji, reply_to_message_id=reply_to_message_id if idx == 0 else None)
         v = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
         vals.append(v)
         if rolls_count > 1:
@@ -1788,10 +1803,12 @@ def telegram_webhook():
                     step = game['step']
                     if step == 'waiting_user_first':
                         u_expr = "+".join(map(str, game['current_user_rolls']))
-                        send_message(chat_id, f"👤 Your Rolls ({expected_emoji}): `{u_expr}` (*{sum(game['current_user_rolls'])}*)\n\n🤖 Now bot is throwing...")
+                        player_tag = format_user_mention(user_id)
+                        user_roll_msg_id = message.get('message_id')
+                        send_message(chat_id, f"👤 {player_tag} Rolls ({expected_emoji}): `{u_expr}` (*{sum(game['current_user_rolls'])}*)\n\n🤖 Now bot is throwing...")
                         time.sleep(0.8)
                         
-                        b_vals = roll_bot_series(chat_id, expected_emoji, rolls_needed)
+                        b_vals = roll_bot_series(chat_id, expected_emoji, rolls_needed, reply_to_message_id=user_roll_msg_id)
                         game['current_bot_rolls'] = b_vals
                         
                         resolve_round_and_match(chat_id, user_id, game)
@@ -2473,6 +2490,7 @@ def telegram_webhook():
                                     "chat_id": chat_id,
                                     "chat_type": chat_type,
                                     "message_id": msg_id,
+                                    "trigger_msg_id": message.get('message_id'),
                                     "emoji": triggered_game,
                                     "bet": bet_inr,
                                     "mode": mode,
@@ -2667,7 +2685,7 @@ def telegram_webhook():
                         f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                     )
                 else:
-                    start_versus_match(target_chat, target_msg, user_id, conf["emoji"], bet_inr, conf["mode"] or "normal", conf["rw_label"], game_id=gid)
+                    start_versus_match(target_chat, target_msg, user_id, conf["emoji"], bet_inr, conf["mode"] or "normal", conf["rw_label"], game_id=gid, trigger_msg_id=conf.get("trigger_msg_id"))
                 return jsonify({'status': 'ok'}), 200
 
             if callback_data == "mc_player":
@@ -3067,9 +3085,11 @@ def telegram_webhook():
                 
                 game["first_turn"] = "bot"
                 game["step"] = "waiting_user_second"
-                send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first...")
+                player_tag = format_user_mention(user_id)
+                trig_id = game.get("trigger_msg_id")
+                send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first for {player_tag}...", reply_to_message_id=trig_id)
                 
-                b_vals = roll_bot_series(chat_id, emoji, rolls_needed)
+                b_vals = roll_bot_series(chat_id, emoji, rolls_needed, reply_to_message_id=trig_id)
                 game["current_bot_rolls"] = b_vals
                 b_expr = "+".join(map(str, b_vals))
                 
