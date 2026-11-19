@@ -209,12 +209,22 @@ def create_zapupi_order(amount, chat_id):
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         data = response.json()
-        if data.get("status") == "success":
-            return f"🔗 *Deposit Link Generated!*\n\nAmount: ₹{amount}\nOrder ID: `{order_id}`\n\n[Click here to Pay & Add Money]({data.get('payment_url')})"
+        if data.get("status") == "success" and data.get("payment_url"):
+            msg = (
+                f"🔗 *Deposit Order Created!*\n\n"
+                f"💰 Amount: *₹{amount}*\n"
+                f"🧾 Order ID: `{order_id}`"
+            )
+            kb = {
+                "inline_keyboard": [
+                    [{"text": "💳 Deposit Now", "url": data.get("payment_url")}]
+                ]
+            }
+            return msg, kb
         else:
-            return f"❌ Failed: {data.get('message', 'Unknown error')}"
-    except Exception as e:
-        return "⚠️ Failed to connect to payment gateway."
+            return f"❌ Failed: {data.get('message', 'Unknown error')}", None
+    except Exception:
+        return "⚠️ Failed to connect to payment gateway.", None
 
 def resolve_round_and_match(chat_id, user_id, game):
     global HOUSE_BALANCE
@@ -236,24 +246,19 @@ def resolve_round_and_match(chat_id, user_id, game):
     mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
     
     if u_sum == b_sum:
-        round_winner = "tie"
         r_status = "🤝 *Round Tied!* No point awarded."
     elif mode == "crazy":
         if u_sum < b_sum:
-            round_winner = "user"
             game["user_wins"] += 1
             r_status = "🎉 *You win this round!* (Lower sum wins)"
         else:
-            round_winner = "bot"
             game["bot_wins"] += 1
             r_status = "🤖 *Bot wins this round!* (Lower sum wins)"
     else:
         if u_sum > b_sum:
-            round_winner = "user"
             game["user_wins"] += 1
             r_status = "🎉 *You win this round!* (Higher sum wins)"
         else:
-            round_winner = "bot"
             game["bot_wins"] += 1
             r_status = "🤖 *Bot wins this round!* (Higher sum wins)"
             
@@ -266,7 +271,6 @@ def resolve_round_and_match(chat_id, user_id, game):
     )
     send_message(chat_id, msg)
     
-    # Check match winner
     if game["user_wins"] >= target_wins or game["bot_wins"] >= target_wins:
         user_won_match = game["user_wins"] >= target_wins
         final_text = f"🏁 *Match Over ({emoji} | {rw_label})*\n\n"
@@ -288,7 +292,6 @@ def resolve_round_and_match(chat_id, user_id, game):
             del active_games[user_id]
         return
 
-    # Prepare next round
     game["round_num"] += 1
     game["current_user_rolls"] = []
     game["current_bot_rolls"] = []
@@ -462,8 +465,8 @@ def telegram_webhook():
                     amt_inr = parse_user_amount(text, user_id)
                     if amt_inr and amt_inr > 0:
                         send_message(chat_id, "⏳ Generating deposit link...")
-                        res_text = create_zapupi_order(amt_inr, user_id)
-                        send_message(chat_id, res_text)
+                        res_text, pay_kb = create_zapupi_order(amt_inr, user_id)
+                        send_message(chat_id, res_text, reply_markup=pay_kb)
                     else:
                         send_message(chat_id, "⚠️ Invalid amount. Use `/deposit <amount>` or `/deposit` again.")
                     return jsonify({'status': 'ok'}), 200
@@ -532,7 +535,6 @@ def telegram_webhook():
                 del withdrawal_states[user_id]
                 return jsonify({'status': 'ok'}), 200
 
-            # --- EMOJI GAME ROLLS (RW MULTI-ROLL SUPPORT) ---
             if 'dice' in message and user_id in active_games:
                 game = active_games[user_id]
                 expected_emoji = game['emoji']
@@ -663,8 +665,8 @@ def telegram_webhook():
                     if len(parts) > 1 and parts[1].replace('.', '', 1).isdigit():
                         amt_inr = parse_user_amount(parts[1], user_id)
                         send_message(chat_id, "⏳ Generating deposit link...")
-                        res_text = create_zapupi_order(amt_inr, user_id)
-                        send_message(chat_id, res_text)
+                        res_text, pay_kb = create_zapupi_order(amt_inr, user_id)
+                        send_message(chat_id, res_text, reply_markup=pay_kb)
                     else:
                         send_message(chat_id, "⚠️ Use format: `/deposit 100`")
 
