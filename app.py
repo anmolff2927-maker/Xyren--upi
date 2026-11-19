@@ -15,6 +15,7 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 BOT_USERNAME = "@Xyren_upibot"
+WINS_CHANNEL_ID = os.environ.get("WINS_CHANNEL_ID", "3555754688")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -26,6 +27,7 @@ approved_groups = set()
 user_balances = {}
 user_currency = {}
 user_usernames = {}
+user_first_names = {}
 username_to_id = {}
 user_stats = {}
 user_deposits = {}
@@ -74,6 +76,38 @@ GAME_NAME_MAP = {
     "🏀": "Basketball",
     "🎳": "Bowling",
 }
+
+def normalize_channel_id(raw_id):
+    if raw_id is None:
+        return None
+    s = str(raw_id).strip()
+    if not s:
+        return None
+    if s.startswith("-100"):
+        return int(s)
+    if s.startswith("-"):
+        num = s[1:]
+        return int(f"-100{num}") if not num.startswith("100") else int(s)
+    if s.isdigit():
+        return int(f"-100{s}")
+    return s
+
+def format_win_actor(user_id):
+    if user_id in user_usernames and user_usernames[user_id]:
+        return f"@{user_usernames[user_id]}"
+    if user_id in user_first_names and user_first_names[user_id]:
+        return user_first_names[user_id]
+    return f"User {user_id}"
+
+def log_win_to_channel(user_id, game_emoji, game_title, won_inr, mult_text=None):
+    target_channel = normalize_channel_id(WINS_CHANNEL_ID)
+    if not target_channel:
+        return
+    actor = format_win_actor(user_id)
+    amt_str = f"₹{won_inr:,.2f}"
+    mult_part = f" `({mult_text})`" if mult_text else ""
+    msg = f"{game_emoji} *{game_title}* · *{actor}* won *{amt_str}*{mult_part}"
+    send_message(target_channel, msg)
 
 def current_timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -137,6 +171,9 @@ def register_user_identity(from_user):
     if uid not in user_balances:
         user_balances[uid] = 0.0
         user_currency[uid] = 'INR'
+    first_name = from_user.get("first_name")
+    if first_name:
+        user_first_names[uid] = first_name.strip()
     uname = from_user.get("username")
     if uname:
         clean_uname = uname.lstrip("@").lower()
@@ -327,6 +364,7 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         record_user_bet(winner_id, label, bet, win_pnl, "WON", game_id=gid)
         record_user_bet(loser_id, label, bet, -bet, "LOST", game_id=gid)
         mark_game_finished(gid, "completed", extra_meta={"winner_id": winner_id, "payout": payout})
+        log_win_to_channel(winner_id, emoji, f"PvP {g_name}", payout, "1.94x")
 
         final_text = (
             f"🏁 *Final Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
@@ -775,6 +813,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         HOUSE_BALANCE -= profit_inr
         update_user_stats(user_id, "blackjack", bet, profit_inr, True)
         record_user_bet(user_id, "Blackjack", bet, profit_inr, "WON", game_id=gid)
+        log_win_to_channel(user_id, "🃏", "Blackjack", win_amt, "1.94x")
         body = f"🎉 *You WON {format_money(win_amt, user_id)}* (`1.94x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
     else:
         profit_inr = -bet
@@ -904,6 +943,7 @@ def resolve_round_and_match(chat_id, user_id, game):
             update_user_stats(user_id, emoji, bet, profit_inr, True)
             record_user_bet(user_id, label, bet, profit_inr, "WON", game_id=gid)
             mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
+            log_win_to_channel(user_id, emoji, g_name, win_amt, "1.94x")
             final_text = (
                 f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
                 f"👤 You: `{u_expr}` = *{u_sum}*\n"
@@ -1615,6 +1655,7 @@ def telegram_webhook():
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, True)
                             record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "WON", game_id=gid)
                             mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
+                            log_win_to_channel(user_id, "🔮", "Predict", win_amt, f"{multiplier}x")
                             result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{multiplier}x`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                         else:
                             profit_inr = -bet_inr
