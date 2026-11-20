@@ -1408,6 +1408,10 @@ def parse_user_amount(text_val, user_id):
     except:
         return None
 
+def _has_fair_link(text):
+    url = os.environ.get("VERIFY_URL")
+    return bool(url and text and url.rstrip("/") in text)
+
 def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     url = f"{TELEGRAM_API_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -1416,6 +1420,8 @@ def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
+    if _has_fair_link(text):
+        payload["link_preview_options"] = {"is_disabled": True}
     try:
         res = requests.post(url, json=payload, timeout=5)
         data = res.json()
@@ -1439,6 +1445,8 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     else:
         payload["reply_markup"] = {"inline_keyboard": []}
+    if _has_fair_link(text):
+        payload["link_preview_options"] = {"is_disabled": True}
     try:
         res = requests.post(url, json=payload, timeout=5)
         data = res.json()
@@ -2427,7 +2435,8 @@ def resolve_round_and_match(chat_id, user_id, game):
 # ---------------------------------------------------------------------
 # result bytes = HMAC_SHA256(key=server_seed, msg=f"{client_seed}:{nonce}:{round}")
 # every 4 bytes -> one float in [0, 1). Player sees sha256(server_seed)
-# before betting; the real server seed is revealed when they change seed.
+# before betting. Every bet gets its own fresh server seed, revealed
+# automatically when that game ends (so it can never predict another bet).
 # =====================================================================
 import hmac as _pf_hmac
 import hashlib as _pf_hashlib
@@ -2619,12 +2628,22 @@ def fair_get_state(uid):
     return st
 
 def fair_take_seeds(uid):
-    """Seeds for the next bet; increases the nonce."""
+    """Seeds for the next bet. The server seed is used for this ONE bet only:
+    a fresh one is prepared right away for the next bet, so revealing this
+    seed after the game can never help predict another game."""
     st = fair_get_state(uid)
     seeds = {"server_seed": st["server_seed"], "client_seed": st["client_seed"], "nonce": st["nonce"]}
     st["nonce"] += 1
+    st["server_seed"] = _pf_secrets.token_hex(32)
     persist_fair_seed(uid)
     return seeds
+
+def fair_reveal(seeds, uid):
+    """Game is over -> publish its server seed so anyone can verify it."""
+    seed_hash = pf_sha256(seeds["server_seed"])
+    if revealed_server_seeds.get(seed_hash) != seeds["server_seed"]:
+        revealed_server_seeds[seed_hash] = seeds["server_seed"]
+        persist_revealed_seed(seed_hash, seeds["server_seed"], uid)
 
 def fair_meta(seeds):
     return {"server_seed_hash": pf_sha256(seeds["server_seed"]), "client_seed": seeds["client_seed"], "nonce": seeds["nonce"]}
@@ -2641,8 +2660,9 @@ def fair_rotate(uid, new_client_seed=None):
     persist_fair_seed(uid)
     return old_seed, old_hash
 
-def fair_link(seeds, kind=None, gid=None, **extra):
-    """Browser link that shows the fairness details of this bet (needs VERIFY_URL)."""
+def fair_link(seeds, kind=None, gid=None, reveal=False, **extra):
+    """Browser link that shows the fairness details of this bet (needs VERIFY_URL).
+    reveal=True only after the game is over: adds the real server seed."""
     if not VERIFY_URL:
         return None
     params = {}
@@ -2653,13 +2673,15 @@ def fair_link(seeds, kind=None, gid=None, **extra):
     params["hash"] = pf_sha256(seeds["server_seed"])
     params["client"] = seeds["client_seed"]
     params["nonce"] = seeds["nonce"]
+    if reveal:
+        params["server"] = seeds["server_seed"]
     for k, v in extra.items():
         if v is not None:
             params[k] = v
     return f"{VERIFY_URL.rstrip('/')}/?{_pf_urlencode(params)}"
 
-def fair_footer(seeds, kind=None, gid=None, **extra):
-    link = fair_link(seeds, kind, gid, **extra)
+def fair_footer(seeds, kind=None, gid=None, reveal=False, **extra):
+    link = fair_link(seeds, kind, gid, reveal, **extra)
     if not link:
         return f"\n\n🔐 _Provably Fair_ · Nonce `{seeds['nonce']}` · /fair"
     return f"\n\n🔐 [Provably Fair]({link})"
@@ -2668,11 +2690,11 @@ def build_fair_text(uid):
     st = fair_get_state(uid)
     return (
         "🔐 *Provably Fair*\n\n"
-        f"🔒 Server Seed (hashed):\n`{pf_sha256(st['server_seed'])}`\n\n"
+        f"🔒 Next Server Seed (hashed):\n`{pf_sha256(st['server_seed'])}`\n\n"
         f"👤 Client Seed: `{st['client_seed']}`\n"
         f"🔢 Nonce (next bet): `{st['nonce']}`\n\n"
-        "ℹ️ Every Mines, Tower and Limbo result comes from these seeds. "
-        "Tap *Change Seed* to reveal your current server seed, then use `/verify <game_id>` to check old games.\n"
+        "ℹ️ Every Mines, Tower and Limbo bet gets its own server seed. "
+        "It is revealed automatically when the game ends — just tap *Provably Fair* on the result message.\n"
         "✏️ Set your own client seed: `/setseed yourtext`"
     )
 
@@ -2755,7 +2777,8 @@ def run_limbo_game(chat_id, user_id, bet_inr, target, reply_to_message_id=None):
         text_out += f"🎉 *You WON {format_money(win_amt, user_id)}*! 🥳"
     else:
         text_out += "😢 *You Lost!*"
-    text_out += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(seeds, "limbo", gid, target=f"{target:.2f}")
+    fair_reveal(seeds, user_id)
+    text_out += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(seeds, "limbo", gid, reveal=True, target=f"{target:.2f}", result=f"{result:.2f}")
     payload = {"kind": "limbo", "owner_id": user_id, "bet": bet_inr, "target": target}
     sent = send_message(chat_id, text_out, reply_markup=create_post_match_keyboard(user_id, payload), reply_to_message_id=reply_to_message_id)
     remember_button_owner(chat_id, sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None, user_id)
@@ -2844,7 +2867,11 @@ def finish_mines_game(user_id, game, won, hit_idx=None):
         body = f"🎉 *Cashed out {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳"
     else:
         body = "💥 *Boom! You hit a mine.*"
-    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(game["seeds"], "mines", game["game_id"], mines=game["mines"])
+    fair_reveal(game["seeds"], user_id)
+    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(
+        game["seeds"], "mines", game["game_id"], reveal=True, mines=game["mines"],
+        picks=",".join(str(i) for i in game["revealed"]) or None,
+        hit=hit_idx)
     payload = {"kind": "mines", "owner_id": user_id, "bet": game["bet"], "mines": game["mines"]}
     edit_message(game["chat_id"], game["message_id"], head + body, reply_markup=create_post_match_keyboard(user_id, payload))
 
@@ -2984,7 +3011,10 @@ def finish_tower_game(user_id, game, won, hit=None):
     else:
         text_out += "🌟 Game over\n🏗 The tower collapsed"
     text_out += f"\n\n💳 Current balance: {format_money(user_balances.get(user_id, 0.0), user_id)}"
-    text_out += fair_footer(game["seeds"], "tower", game["game_id"], difficulty=game["difficulty"])
+    fair_reveal(game["seeds"], user_id)
+    text_out += fair_footer(game["seeds"], "tower", game["game_id"], reveal=True, difficulty=game["difficulty"],
+                            picks=",".join(str(c) for c in game["picks"]) or None,
+                            hit=hit[1] if hit else None)
     grid = tower_result_rows(game, hit)
     payload = {"kind": "tower", "owner_id": user_id, "bet": game["bet"], "difficulty": game["difficulty"], "result_grid": grid}
     post_kb = create_post_match_keyboard(user_id, payload)
@@ -3042,7 +3072,7 @@ def build_verify_text(gid):
         f"🔢 Nonce: `{meta.get('nonce')}`\n"
     )
     if not server_seed:
-        return head + "\n⏳ Server seed is still hidden. The owner must tap *Change Seed* in /fair first, then verify again."
+        return head + "\n⏳ This game is still running. The server seed is revealed automatically when it ends."
     seeds = {"server_seed": server_seed, "client_seed": meta.get("client_seed"), "nonce": int(meta.get("nonce", 0))}
     head += f"🔓 Server Seed: `{server_seed}`\n✅ Hash matches: *{'YES' if pf_sha256(server_seed) == seed_hash else 'NO'}*\n\n"
     link_params = f"server={server_seed}&client={seeds['client_seed']}&nonce={seeds['nonce']}"
