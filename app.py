@@ -372,6 +372,25 @@ EXCHANGE_RATE = 98.0
 MAINTENANCE_MODE = False
 DEPOSIT_ENABLED = True
 WITHDRAW_ENABLED = True
+DM_GAMES_ENABLED = True
+GROUP_LINK = None
+
+DM_GAME_COMMANDS = ['/dice', '/dart', '/foot', '/basket', '/bowl', '/dr', '/bj', '/7up']
+
+def is_dm_game_command(text):
+    bot_name = re.escape(BOT_USERNAME.lstrip('@'))
+    for cmd in DM_GAME_COMMANDS:
+        if re.match(rf"^{re.escape(cmd)}(?:@{bot_name})?(?:\s|$)", text, re.IGNORECASE):
+            return True
+    return False
+
+def build_dm_games_off_text():
+    if GROUP_LINK:
+        safe_link = GROUP_LINK.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
+        place = safe_link
+    else:
+        place = "our group"
+    return f"❌ Games in DM are currently turned off.\n\nPlease play in {place}."
 
 PAGE_SIZE = 5
 
@@ -688,6 +707,8 @@ def persist_config_all():
     save_config_value("deposit_enabled", DEPOSIT_ENABLED)
     save_config_value("withdraw_enabled", WITHDRAW_ENABLED)
     save_config_value("game_multipliers", GAME_MULTIPLIERS)
+    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+    save_config_value("group_link", GROUP_LINK)
 
 def persist_user(uid):
     if uid is None:
@@ -819,7 +840,7 @@ def persist_game_record(game_id, record):
         conn.close()
 
 def load_all_from_db():
-    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED
+    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED, DM_GAMES_ENABLED, GROUP_LINK
     conn = get_db_connection()
     if not conn:
         return
@@ -843,6 +864,10 @@ def load_all_from_db():
                     DEPOSIT_ENABLED = bool(v)
                 elif k == "withdraw_enabled":
                     WITHDRAW_ENABLED = bool(v)
+                elif k == "dm_games_enabled":
+                    DM_GAMES_ENABLED = bool(v)
+                elif k == "group_link":
+                    GROUP_LINK = v if v else None
                 elif k == "game_multipliers" and isinstance(v, dict):
                     for mk, mv in v.items():
                         if mk == "dr_nums" and isinstance(mv, dict):
@@ -2265,7 +2290,7 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
-    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED
+    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED, DM_GAMES_ENABLED, GROUP_LINK
     try:
         data = request.get_json()
         if not data:
@@ -2593,6 +2618,44 @@ def telegram_webhook():
             if 'text' in message:
                 text = message['text'].strip()
 
+                if re.match(rf"^/offgame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    DM_GAMES_ENABLED = False
+                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+                    send_message(chat_id, "🔴 *Games in Bot DM are now OFF.*\nPlayers will be asked to play in the group.")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/ongame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    DM_GAMES_ENABLED = True
+                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+                    send_message(chat_id, "🟢 *Games in Bot DM are now ON.*")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/setgc(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        current = GROUP_LINK if GROUP_LINK else "Not set"
+                        current = current.replace('_', '\\_')
+                        send_message(chat_id, f"🔗 Current Group Link: {current}\nUsage: `/setgc @grouplink`")
+                        return jsonify({'status': 'ok'}), 200
+                    GROUP_LINK = parts[1].strip()
+                    save_config_value("group_link", GROUP_LINK)
+                    safe = GROUP_LINK.replace('_', '\\_')
+                    send_message(chat_id, f"✅ Group link set to: {safe}")
+                    return jsonify({'status': 'ok'}), 200
+
+                if chat_type == 'private' and not DM_GAMES_ENABLED and is_dm_game_command(text):
+                    send_message(chat_id, build_dm_games_off_text())
+                    return jsonify({'status': 'ok'}), 200
+
                 if re.match(rf"^/setrate(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
                         send_message(chat_id, "⛔ Unauthorized.")
@@ -2610,40 +2673,6 @@ def telegram_webhook():
                         send_message(chat_id, f"✅ Exchange rate updated to *₹{EXCHANGE_RATE:.2f} / USDT*.")
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid positive rate (e.g. `/setrate 98`).")
-                    return jsonify({'status': 'ok'}), 200
-
-                if re.match(rf"^/offgame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
-                    if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
-                        return jsonify({'status': 'ok'}), 200
-                    DM_GAMES_ENABLED = False
-                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
-                    send_message(chat_id, "🔴 DM Games turned *OFF* (Only Emoji & BJ allowed in DM; other games in group).")
-                    return jsonify({'status': 'ok'}), 200
-
-                if re.match(rf"^/ongame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
-                    if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
-                        return jsonify({'status': 'ok'}), 200
-                    DM_GAMES_ENABLED = True
-                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
-                    send_message(chat_id, "🟢 DM Games turned *ON*.")
-                    return jsonify({'status': 'ok'}), 200
-
-                if re.match(rf"^/setgc(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
-                    if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
-                        return jsonify({'status': 'ok'}), 200
-                    parts = text.split(maxsplit=1)
-                    if len(parts) < 2 or not parts[1].strip():
-                        send_message(chat_id, f"🔗 Current Group Link: {GROUP_LINK}\nUsage: /setgc @grouplink")
-                        return jsonify({'status': 'ok'}), 200
-                    raw_gc = parts[1].strip()
-                    if not raw_gc.startswith("@") and not raw_gc.startswith("http"):
-                        raw_gc = f"@{raw_gc}"
-                    GROUP_LINK = raw_gc
-                    save_config_value("group_link", GROUP_LINK)
-                    send_message(chat_id, f"✅ Group link set to {GROUP_LINK}.")
                     return jsonify({'status': 'ok'}), 200
 
                 if re.match(rf"^/sethb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
@@ -3243,6 +3272,7 @@ def telegram_webhook():
                             f"🛠 *Maintenance:* {'🟢 OFF' if not MAINTENANCE_MODE else '🔴 ON'}\n"
                             f"💳 *Deposits:* {'🟢 Enabled' if DEPOSIT_ENABLED else '🔴 Disabled'}\n"
                             f"💸 *Withdrawals:* {'🟢 Enabled' if WITHDRAW_ENABLED else '🔴 Disabled'}\n"
+                            f"🎮 *DM Games:* {'🟢 ON' if DM_GAMES_ENABLED else '🔴 OFF'}\n"
                             f"🏦 *House Balance:* ₹{HOUSE_BALANCE:,.2f}"
                         )
                         admin_keyboard = {
@@ -3494,6 +3524,12 @@ def telegram_webhook():
                 else:
                     edit_message(chat_id, message_id, "❌ *Transaction Cancelled.*")
                     answer_callback(callback_query_id, "Transaction cancelled.")
+                return jsonify({'status': 'ok'}), 200
+
+            if chat_type == 'private' and not DM_GAMES_ENABLED and (callback_data.startswith("pm_again_") or callback_data.startswith("pm_double_")):
+                answer_callback(callback_query_id, "❌ Games in DM are currently turned off.")
+                remove_inline_keyboard(chat_id, message_id)
+                send_message(chat_id, build_dm_games_off_text())
                 return jsonify({'status': 'ok'}), 200
 
             if callback_data.startswith("pm_again_") or callback_data.startswith("pm_double_"):
