@@ -1223,6 +1223,13 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
     }
     schedule_pvb_turn_timeout(chat_id, user_id, active_games[user_id])
 
+def roll_text(vals):
+    """Single roll -> '4'; multiple rolls -> '3+4 = 7'."""
+    total = sum(vals)
+    if len(vals) <= 1:
+        return f"{total}"
+    return f"{'+'.join(map(str, vals))} = {total}"
+
 def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     global HOUSE_BALANCE
     gid = pvm.get("game_id") or match_id
@@ -1245,21 +1252,26 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     round_num = pvm["round_num"]
     mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
 
+    round_winner = None
     if s1 == s2:
         r_status = "🤝 *Round Tied!* No point awarded."
     elif mode == "crazy":
         if s1 < s2:
             pvm["p1_wins"] += 1
+            round_winner = p1
             r_status = f"✨ {tag_player(p1)} takes this round! (Lower sum wins)"
         else:
             pvm["p2_wins"] += 1
+            round_winner = p2
             r_status = f"✨ {tag_player(p2)} takes this round! (Lower sum wins)"
     else:
         if s1 > s2:
             pvm["p1_wins"] += 1
+            round_winner = p1
             r_status = f"✨ {tag_player(p1)} takes this round! (Higher sum wins)"
         else:
             pvm["p2_wins"] += 1
+            round_winner = p2
             r_status = f"✨ {tag_player(p2)} takes this round! (Higher sum wins)"
 
     if pvm["p1_wins"] >= target_wins or pvm["p2_wins"] >= target_wins:
@@ -1287,11 +1299,15 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         log_win_to_channel(winner_id, emoji, f"PvP {g_name}", payout, fmt_mult(mult))
 
         final_text = (
-            f"🏁 *Final Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
-            f"👤 {tag_player(p1)}: `{expr1}` = *{s1}*\n"
-            f"👤 {tag_player(p2)}: `{expr2}` = *{s2}*\n\n"
-            f"🌟 *Match Won by* {tag_player(winner_id)} 🌟\n"
-            f"🎁 *Payout:* *{format_money(payout, winner_id)}* (`{fmt_mult(mult)}`)"
+            f"⚔️ *Final Round Result*\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"{emoji} {tag_player(p1)} — {roll_text(r1_vals)}{' ✅' if winner_id == p1 else ''}\n"
+            f"{emoji} {tag_player(p2)} — {roll_text(r2_vals)}{' ✅' if winner_id == p2 else ''}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🔥 Winner: {tag_player(winner_id)}\n"
+            f"🏆 Score: {pvm['p1_wins']} : {pvm['p2_wins']} | First to {target_wins}\n"
+            f"🆔 `{gid}`\n"
+            f"💰 Final payout: {format_money(payout, winner_id)} ({fmt_mult(mult)})"
         )
         send_message(chat_id, final_text)
 
@@ -1302,12 +1318,19 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
             active_games.pop(p2, None)
         return
 
+    if round_winner is None:
+        winner_line = "🤝 Round Tied — no point"
+    else:
+        winner_line = f"🔥 Winner: {tag_player(round_winner)}"
     msg = (
-        f"⚔️ *Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
-        f"👤 {tag_player(p1)}: `{expr1}` = *{s1}*\n"
-        f"👤 {tag_player(p2)}: `{expr2}` = *{s2}*\n"
-        f"{r_status}\n"
-        f"🏆 Score — {tag_player(p1)}: *{pvm['p1_wins']}* | {tag_player(p2)}: *{pvm['p2_wins']}* (First to *{target_wins}*)"
+        f"⚔️ *Round {round_num} Result*\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{emoji} {tag_player(p1)} — {roll_text(r1_vals)}{' ✅' if round_winner == p1 else ''}\n"
+        f"{emoji} {tag_player(p2)} — {roll_text(r2_vals)}{' ✅' if round_winner == p2 else ''}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{winner_line}\n"
+        f"🏆 Score: {pvm['p1_wins']} : {pvm['p2_wins']} | First to {target_wins}\n"
+        f"🆔 `{gid}`"
     )
     send_message(chat_id, msg)
 
