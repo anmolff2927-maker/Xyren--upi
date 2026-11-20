@@ -983,6 +983,15 @@ def format_user_mention(user_id):
     safe_name = str(fname).replace("[", "").replace("]", "")
     return f"[{safe_name}](tg://user?id={user_id})"
 
+def tag_player(user_id):
+    """Clickable mention that tags the player (safe for Markdown)."""
+    uname = user_usernames.get(user_id)
+    if uname:
+        return "@" + str(uname).replace("_", "\\_")
+    fname = user_first_names.get(user_id) or "Player"
+    safe_name = re.sub(r"[\[\]_*`()]", "", str(fname)).strip() or "Player"
+    return f"[{safe_name}](tg://user?id={user_id})"
+
 def format_win_actor(user_id):
     if user_id in user_usernames and user_usernames[user_id]:
         return f"@{user_usernames[user_id]}"
@@ -1241,17 +1250,17 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     elif mode == "crazy":
         if s1 < s2:
             pvm["p1_wins"] += 1
-            r_status = f"✨ *Player 1 (`{p1}`)* takes this round! (Lower sum wins)"
+            r_status = f"✨ {tag_player(p1)} takes this round! (Lower sum wins)"
         else:
             pvm["p2_wins"] += 1
-            r_status = f"✨ *Player 2 (`{p2}`)* takes this round! (Lower sum wins)"
+            r_status = f"✨ {tag_player(p2)} takes this round! (Lower sum wins)"
     else:
         if s1 > s2:
             pvm["p1_wins"] += 1
-            r_status = f"✨ *Player 1 (`{p1}`)* takes this round! (Higher sum wins)"
+            r_status = f"✨ {tag_player(p1)} takes this round! (Higher sum wins)"
         else:
             pvm["p2_wins"] += 1
-            r_status = f"✨ *Player 2 (`{p2}`)* takes this round! (Higher sum wins)"
+            r_status = f"✨ {tag_player(p2)} takes this round! (Higher sum wins)"
 
     if pvm["p1_wins"] >= target_wins or pvm["p2_wins"] >= target_wins:
         winner_id = p1 if pvm["p1_wins"] >= target_wins else p2
@@ -1279,9 +1288,9 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
 
         final_text = (
             f"🏁 *Final Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
-            f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
-            f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n\n"
-            f"🌟 *Match Won by `{winner_id}`!* 🌟\n"
+            f"👤 {tag_player(p1)}: `{expr1}` = *{s1}*\n"
+            f"👤 {tag_player(p2)}: `{expr2}` = *{s2}*\n\n"
+            f"🌟 *Match Won by* {tag_player(winner_id)} 🌟\n"
             f"🎁 *Payout:* *{format_money(payout, winner_id)}* (`{fmt_mult(mult)}`)"
         )
         send_message(chat_id, final_text)
@@ -1295,10 +1304,10 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
 
     msg = (
         f"⚔️ *Round {round_num}* (`{gid}` | {emoji} | `{rw_label}` | {mode_tag})\n"
-        f"👤 P1 (`{p1}`): `{expr1}` = *{s1}*\n"
-        f"👤 P2 (`{p2}`): `{expr2}` = *{s2}*\n"
+        f"👤 {tag_player(p1)}: `{expr1}` = *{s1}*\n"
+        f"👤 {tag_player(p2)}: `{expr2}` = *{s2}*\n"
         f"{r_status}\n"
-        f"🏆 Score — P1: *{pvm['p1_wins']}* | P2: *{pvm['p2_wins']}* (First to *{target_wins}*)"
+        f"🏆 Score — {tag_player(p1)}: *{pvm['p1_wins']}* | {tag_player(p2)}: *{pvm['p2_wins']}* (First to *{target_wins}*)"
     )
     send_message(chat_id, msg)
 
@@ -1308,7 +1317,7 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     pvm["turn"] = p1
     send_message(
         chat_id,
-        f"➡️ *Round {pvm['round_num']}* — Player 1 (`{p1}`), send `{emoji}` x{pvm['rolls_per_round']} in chat!"
+        f"➡️ *Round {pvm['round_num']}* — {tag_player(p1)}, send `{emoji}` x{pvm['rolls_per_round']} in chat!"
     )
     schedule_pvp_turn_timeout(chat_id, match_id, pvm)
 
@@ -1374,9 +1383,14 @@ def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
         payload["reply_markup"] = reply_markup
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
+        payload["allow_sending_without_reply"] = True
     try:
         res = requests.post(url, json=payload, timeout=5)
-        return res.json()
+        data = res.json()
+        if not data.get("ok") and "parse" in str(data.get("description", "")).lower():
+            payload.pop("parse_mode", None)
+            data = requests.post(url, json=payload, timeout=5).json()
+        return data
     except Exception as e:
         print(f"Error sending message: {e}")
         return None
@@ -1395,7 +1409,11 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
         payload["reply_markup"] = {"inline_keyboard": []}
     try:
         res = requests.post(url, json=payload, timeout=5)
-        return res.json()
+        data = res.json()
+        if not data.get("ok") and "parse" in str(data.get("description", "")).lower():
+            payload.pop("parse_mode", None)
+            data = requests.post(url, json=payload, timeout=5).json()
+        return data
     except Exception as e:
         print(f"Error editing message: {e}")
         return None
@@ -2568,13 +2586,13 @@ def telegram_webhook():
 
                         rem = needed - len(roll_list)
                         if rem > 0:
-                            send_message(chat_id, f"🎲 Player `{user_id}` Roll `{len(roll_list)}/{needed}`: *{val}* — Send `{rem}` more `{pvm['emoji']}`!")
+                            send_message(chat_id, f"🎲 {tag_player(user_id)} Roll `{len(roll_list)}/{needed}`: *{val}* — Send `{rem}` more `{pvm['emoji']}`!")
                             schedule_pvp_turn_timeout(chat_id, active_ref, pvm)
                             return jsonify({'status': 'ok'}), 200
 
                         if is_p1:
                             expr = "+".join(map(str, roll_list))
-                            send_message(chat_id, f"👤 P1 (`{pvm['p1_id']}`) Rolls: `{expr}` (*{sum(roll_list)}*)\n\n👉 *Player 2 (`{pvm['p2_id']}`), your turn! Send `{pvm['emoji']}` x{needed}.*")
+                            send_message(chat_id, f"👤 {tag_player(pvm['p1_id'])} Rolls: `{expr}` (*{sum(roll_list)}*)\n\n👉 {tag_player(pvm['p2_id'])}, *your turn! Send* `{pvm['emoji']}` *x{needed}.*")
                             pvm["turn"] = pvm["p2_id"]
                             schedule_pvp_turn_timeout(chat_id, active_ref, pvm)
                         else:
@@ -3455,7 +3473,10 @@ def telegram_webhook():
                             g_name = GAME_NAME_MAP.get(triggered_game, "Game")
                             if rw_label is not None and mode is not None:
                                 conf_msg = build_match_confirmation_text(user_id, triggered_game, bet_inr, mode, rw_label, game_id=gid)
-                                sent = send_message(chat_id, conf_msg, reply_markup=match_confirm_keyboard(chat_type))
+                                sent = send_message(
+                                    chat_id, conf_msg, reply_markup=match_confirm_keyboard(chat_type),
+                                    reply_to_message_id=message.get('message_id') if chat_type in ['group', 'supergroup'] else None
+                                )
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
                                 pending_game_setup[user_id] = {
                                     "game_id": gid,
@@ -3765,7 +3786,7 @@ def telegram_webhook():
                 invite_msg = (
                     "⚔️ *Player vs Player Challenge!*\n\n"
                     f"🆔 *Game ID:* `{gid}`\n"
-                    f"👤 *Challenger:* `{user_id}`\n"
+                    f"👤 *Challenger:* {tag_player(user_id)}\n"
                     f"🎮 *Game:* {g_name} ({conf['emoji']})\n"
                     f"⚙️ *Mode:* *{mode_label}*\n"
                     f"🏆 *RW Format:* `{rw_label}` (First to *{target_wins}*)\n"
@@ -3877,9 +3898,9 @@ def telegram_webhook():
 
                 start_text = (
                     f"🎮 *PvP Match Started!* (`{gid}` | {ch['emoji']} | `{ch['rw_label']}`)\n"
-                    f"👤 P1: `{host_id}` vs P2: `{user_id}` | Bet: *{format_money(bet_inr, user_id)}*\n"
+                    f"👤 {tag_player(host_id)} vs {tag_player(user_id)} | Bet: *{format_money(bet_inr, user_id)}*\n"
                     f"🎯 First to *{ch['target_wins']}* round win(s) | *{ch['rolls_per_round']}* roll(s)/round\n\n"
-                    f"👉 *Round 1 — Player 1 (`{host_id}`), send `{ch['emoji']}` x{ch['rolls_per_round']} in chat!*"
+                    f"👉 *Round 1 —* {tag_player(host_id)}, *send* `{ch['emoji']}` *x{ch['rolls_per_round']} in chat!*"
                 )
                 edit_message(target_chat, target_msg, start_text)
                 schedule_pvp_turn_timeout(target_chat, match_id, active_pvp_games[match_id])
