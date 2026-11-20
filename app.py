@@ -61,6 +61,12 @@ def get_active_game_summary(user_id):
         g7 = active_7up_games[user_id]
         gid = g7.get("game_id")
         return f"7Up (`{gid}`)" if gid else "7Up"
+    if user_id in globals().get("active_mines_games", {}):
+        gid = active_mines_games[user_id].get("game_id")
+        return f"Mines (`{gid}`)"
+    if user_id in globals().get("active_tower_games", {}):
+        gid = active_tower_games[user_id].get("game_id")
+        return f"Tower (`{gid}`)"
     if user_id in active_bj_games:
         gbj = active_bj_games[user_id]
         gid = gbj.get("game_id")
@@ -377,7 +383,7 @@ WITHDRAW_ENABLED = True
 DM_GAMES_ENABLED = True
 GROUP_LINK = None
 
-DM_GAME_COMMANDS = ['/dice', '/dart', '/foot', '/basket', '/bowl', '/dr', '/bj', '/7up']
+DM_GAME_COMMANDS = ['/dice', '/dart', '/foot', '/basket', '/bowl', '/dr', '/bj', '/7up', '/mines', '/tower', '/limbo']
 
 def is_dm_game_command(text):
     bot_name = re.escape(BOT_USERNAME.lstrip('@'))
@@ -1738,6 +1744,10 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         )
         answer_callback(callback_query_id, f"Started {format_money(next_bet, user_id)} match!")
 
+    elif kind in ("mines", "tower", "limbo"):
+        answer_callback(callback_query_id, f"Starting {kind.title()} ({format_money(next_bet, user_id)})!")
+        restart_fair_game(chat_id, user_id, payload, next_bet)
+
     elif kind == "7up":
         choice_7up = normalize_7up_choice(payload.get("choice_7up")) or "up"
         answer_callback(callback_query_id, f"Rolling 7Up ({format_money(next_bet, user_id)})!")
@@ -2012,6 +2022,9 @@ def build_game_search_report(target_gid):
         "blackjack": "🃏 Blackjack",
         "prediction": "🔮 Dice Prediction",
         "seven_up": "🎲🎲 7Up",
+        "mines": "💣 Mines",
+        "tower": "🗼 Tower",
+        "limbo": "🚀 Limbo",
     }
     kind_str = kind_labels.get(rec.get("kind"), rec.get("kind", "Game"))
     status_str = str(rec.get("status", "unknown")).upper()
@@ -2114,6 +2127,16 @@ def cancel_game_by_id(target_gid):
     elif kind == "prediction":
         if refund and bet_inr > 0:
             user_balances[owner_id] = user_balances.get(owner_id, 0.0) + bet_inr
+    elif kind in ("mines", "tower"):
+        store = active_mines_games if kind == "mines" else active_tower_games
+        live = store.get(owner_id)
+        if live and live.get("game_id") == gid and (live.get("revealed") or live.get("picks")):
+            return False, f"⚠️ Game `{gid}` already has picks. Use the 💰 Cashout button instead."
+        if live and live.get("game_id") == gid:
+            store.pop(owner_id, None)
+        if refund and bet_inr > 0:
+            user_balances[owner_id] = user_balances.get(owner_id, 0.0) + bet_inr
+            persist_user(owner_id)
 
     mark_game_finished(gid, "cancelled")
     refund_note = " Stake refunded." if refund and bet_inr > 0 else ""
@@ -2387,6 +2410,693 @@ def resolve_round_and_match(chat_id, user_id, game):
         game["step"] = "waiting_user_first"
         send_message(chat_id, f"👤 *Round {game['round_num']}* — Your turn! Send `{emoji}` x{rolls_per_round} in chat.")
         schedule_pvb_turn_timeout(chat_id, user_id, game)
+
+# =====================================================================
+# 🔐 PROVABLY FAIR GAMES: MINES · TOWER · LIMBO
+# ---------------------------------------------------------------------
+# result bytes = HMAC_SHA256(key=server_seed, msg=f"{client_seed}:{nonce}:{round}")
+# every 4 bytes -> one float in [0, 1). Player sees sha256(server_seed)
+# before betting; the real server seed is revealed when they change seed.
+# =====================================================================
+import hmac as _pf_hmac
+import hashlib as _pf_hashlib
+import secrets as _pf_secrets
+import math as _pf_math
+
+FAIR_HOUSE_EDGE = 0.08          # 8% house edge
+FAIR_RTP = 1.0 - FAIR_HOUSE_EDGE
+VERIFY_URL = os.environ.get("VERIFY_URL")  # optional: link to the online verify page
+
+MINES_TILES = 25
+MINES_DEFAULT = 3
+LIMBO_MAX = 1000000.0
+LIMBO_MIN_TARGET = 1.01
+LIMBO_MAX_TARGET = 1000.0
+TOWER_LEVELS = 9
+TOWER_DIFFICULTIES = {
+    "easy":   {"cols": 4, "bombs": 1},
+    "medium": {"cols": 3, "bombs": 1},
+    "hard":   {"cols": 2, "bombs": 1},
+    "expert": {"cols": 3, "bombs": 2},
+    "master": {"cols": 4, "bombs": 3},
+}
+
+fair_seeds = {}             # uid -> {"server_seed", "client_seed", "nonce"}
+revealed_server_seeds = {}  # sha256(server_seed) -> server_seed
+active_mines_games = {}     # uid -> game dict
+active_tower_games = {}     # uid -> game dict
+
+
+# ---------------- core math (same as the verify page) ----------------
+def pf_sha256(text_val):
+    return _pf_hashlib.sha256(text_val.encode()).hexdigest()
+
+def pf_floats(server_seed, client_seed, nonce, count):
+    out = []
+    rnd = 0
+    while len(out) < count:
+        msg = f"{client_seed}:{nonce}:{rnd}".encode()
+        digest = _pf_hmac.new(server_seed.encode(), msg, _pf_hashlib.sha256).digest()
+        for i in range(0, 32, 4):
+            if len(out) >= count:
+                break
+            f = 0.0
+            for j in range(4):
+                f += digest[i + j] / (256 ** (j + 1))
+            out.append(f)
+        rnd += 1
+    return out
+
+def pf_pick(floats, size, picks):
+    pool = list(range(size))
+    res = []
+    for i in range(picks):
+        idx = int(_pf_math.floor(floats[i] * len(pool)))
+        res.append(pool.pop(idx))
+    return res
+
+def pf_floor2(x):
+    return _pf_math.floor(x * 100) / 100
+
+def pf_limbo_result(seeds):
+    f = pf_floats(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], 1)[0]
+    if f == 0:
+        return LIMBO_MAX
+    return min(LIMBO_MAX, max(1.0, pf_floor2((1.0 / f) * FAIR_RTP)))
+
+def pf_mines_layout(seeds, mines):
+    floats = pf_floats(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], mines)
+    return pf_pick(floats, MINES_TILES, mines)
+
+def pf_mines_multiplier(mines, safe_revealed):
+    if safe_revealed <= 0:
+        return 1.0
+    fair = 1.0
+    for i in range(safe_revealed):
+        fair *= (MINES_TILES - i) / (MINES_TILES - mines - i)
+    return pf_floor2(fair * FAIR_RTP)
+
+def pf_tower_layout(seeds, difficulty):
+    cfg = TOWER_DIFFICULTIES[difficulty]
+    cols, bombs = cfg["cols"], cfg["bombs"]
+    floats = pf_floats(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], TOWER_LEVELS * bombs)
+    levels = []
+    for lvl in range(TOWER_LEVELS):
+        levels.append(sorted(pf_pick(floats[lvl * bombs:(lvl + 1) * bombs], cols, bombs)))
+    return levels
+
+def pf_tower_multiplier(difficulty, levels_cleared):
+    if levels_cleared <= 0:
+        return 1.0
+    cfg = TOWER_DIFFICULTIES[difficulty]
+    return pf_floor2((cfg["cols"] / (cfg["cols"] - cfg["bombs"])) ** levels_cleared * FAIR_RTP)
+
+
+# ---------------- seeds storage ----------------
+def init_fair_db():
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS fair_seeds (
+                        user_id BIGINT PRIMARY KEY,
+                        server_seed TEXT,
+                        client_seed TEXT,
+                        nonce BIGINT DEFAULT 0
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS fair_revealed_seeds (
+                        seed_hash TEXT PRIMARY KEY,
+                        server_seed TEXT,
+                        user_id BIGINT
+                    )
+                """)
+    except Exception as e:
+        print(f"DB init_fair error: {e}")
+    finally:
+        conn.close()
+
+def load_fair_from_db():
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT user_id, server_seed, client_seed, nonce FROM fair_seeds")
+            for r in cur.fetchall():
+                fair_seeds[int(r["user_id"])] = {
+                    "server_seed": r["server_seed"],
+                    "client_seed": r["client_seed"],
+                    "nonce": int(r["nonce"] or 0),
+                }
+            cur.execute("SELECT seed_hash, server_seed FROM fair_revealed_seeds")
+            for r in cur.fetchall():
+                revealed_server_seeds[r["seed_hash"]] = r["server_seed"]
+    except Exception as e:
+        print(f"DB load_fair error: {e}")
+    finally:
+        conn.close()
+
+def persist_fair_seed(uid):
+    st = fair_seeds.get(uid)
+    conn = get_db_connection()
+    if not conn or not st:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO fair_seeds (user_id, server_seed, client_seed, nonce) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET server_seed = EXCLUDED.server_seed,
+                        client_seed = EXCLUDED.client_seed, nonce = EXCLUDED.nonce
+                    """,
+                    (uid, st["server_seed"], st["client_seed"], st["nonce"])
+                )
+    except Exception as e:
+        print(f"DB persist_fair_seed error ({uid}): {e}")
+    finally:
+        conn.close()
+
+def persist_revealed_seed(seed_hash, server_seed, uid):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO fair_revealed_seeds (seed_hash, server_seed, user_id) VALUES (%s, %s, %s) ON CONFLICT (seed_hash) DO NOTHING",
+                    (seed_hash, server_seed, uid)
+                )
+    except Exception as e:
+        print(f"DB persist_revealed_seed error: {e}")
+    finally:
+        conn.close()
+
+def fair_get_state(uid):
+    st = fair_seeds.get(uid)
+    if not st:
+        st = {"server_seed": _pf_secrets.token_hex(32), "client_seed": _pf_secrets.token_hex(10), "nonce": 0}
+        fair_seeds[uid] = st
+        persist_fair_seed(uid)
+    return st
+
+def fair_take_seeds(uid):
+    """Seeds for the next bet; increases the nonce."""
+    st = fair_get_state(uid)
+    seeds = {"server_seed": st["server_seed"], "client_seed": st["client_seed"], "nonce": st["nonce"]}
+    st["nonce"] += 1
+    persist_fair_seed(uid)
+    return seeds
+
+def fair_meta(seeds):
+    return {"server_seed_hash": pf_sha256(seeds["server_seed"]), "client_seed": seeds["client_seed"], "nonce": seeds["nonce"]}
+
+def fair_rotate(uid, new_client_seed=None):
+    st = fair_get_state(uid)
+    old_seed = st["server_seed"]
+    old_hash = pf_sha256(old_seed)
+    revealed_server_seeds[old_hash] = old_seed
+    persist_revealed_seed(old_hash, old_seed, uid)
+    st["server_seed"] = _pf_secrets.token_hex(32)
+    st["client_seed"] = new_client_seed or _pf_secrets.token_hex(10)
+    st["nonce"] = 0
+    persist_fair_seed(uid)
+    return old_seed, old_hash
+
+def fair_footer(seeds):
+    return f"\n\n🔐 _Provably Fair_ · Nonce `{seeds['nonce']}` · /fair"
+
+def build_fair_text(uid):
+    st = fair_get_state(uid)
+    return (
+        "🔐 *Provably Fair*\n\n"
+        f"🔒 Server Seed (hashed):\n`{pf_sha256(st['server_seed'])}`\n\n"
+        f"👤 Client Seed: `{st['client_seed']}`\n"
+        f"🔢 Nonce (next bet): `{st['nonce']}`\n\n"
+        "ℹ️ Every Mines, Tower and Limbo result comes from these seeds. "
+        "Tap *Change Seed* to reveal your current server seed, then use `/verify <game_id>` to check old games.\n"
+        "✏️ Set your own client seed: `/setseed yourtext`"
+    )
+
+def fair_keyboard():
+    return {"inline_keyboard": [[{"text": "🔄 Change Seed (reveal)", "callback_data": "pf_rotate"}]]}
+
+def clean_client_seed(raw):
+    cleaned = re.sub(r"[^A-Za-z0-9\-]", "", raw or "")[:32]
+    return cleaned or None
+
+def has_open_fair_game(uid):
+    return uid in active_mines_games or uid in active_tower_games
+
+
+# ---------------- shared bet helpers ----------------
+def fair_validate_bet(chat_id, user_id, bet_inr, example):
+    if is_player_in_active_game(user_id):
+        send_message(chat_id, f"⚠️ You already have an active game (*{get_active_game_summary(user_id)}*)! Finish it before starting a new game.")
+        return False
+    if bet_inr is None or bet_inr <= 0:
+        send_message(chat_id, f"⚠️ Enter a valid bet amount. Example: `{example}`")
+        return False
+    if bet_inr < MIN_BET or bet_inr > MAX_BET:
+        send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+        return False
+    bal = float(user_balances.get(user_id, 0.0))
+    if bal < bet_inr:
+        send_message(chat_id, f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*")
+        return False
+    return True
+
+def fair_settle(user_id, game_key, game_label, emoji, title, bet, mult, won, gid, outcome_meta):
+    """won=True pays bet*mult. Returns (win_amt, profit)."""
+    global HOUSE_BALANCE
+    if won:
+        win_amt = bet * mult
+        profit = win_amt - bet
+        user_balances[user_id] = float(user_balances.get(user_id, 0.0)) + win_amt
+        HOUSE_BALANCE -= profit
+        persist_user(user_id)
+        save_config_value("house_balance", HOUSE_BALANCE)
+        update_user_stats(user_id, game_key, bet, profit, profit > 0)
+        record_user_bet(user_id, game_label, bet, profit, "WON", game_id=gid)
+        if profit > 0:
+            log_win_to_channel(user_id, emoji, title, win_amt, fmt_mult(mult))
+    else:
+        win_amt = 0.0
+        profit = -bet
+        HOUSE_BALANCE += bet
+        save_config_value("house_balance", HOUSE_BALANCE)
+        update_user_stats(user_id, game_key, bet, profit, False)
+        record_user_bet(user_id, game_label, bet, profit, "LOST", game_id=gid)
+    mark_game_finished(gid, "completed", extra_meta=dict(outcome_meta, outcome="WON" if won else "LOST", pnl=profit))
+    return win_amt, profit
+
+
+# ---------------- LIMBO ----------------
+def run_limbo_game(chat_id, user_id, bet_inr, target, reply_to_message_id=None):
+    if not fair_validate_bet(chat_id, user_id, bet_inr, "/limbo 50 2"):
+        return
+    gid = generate_game_id()
+    user_balances[user_id] = float(user_balances.get(user_id, 0.0)) - bet_inr
+    persist_user(user_id)
+    seeds = fair_take_seeds(user_id)
+    meta = dict(fair_meta(seeds), chat_id=chat_id, target=target)
+    register_game_record(gid, "limbo", user_id, bet_inr, meta=meta, refund_on_cancel=False)
+
+    result = pf_limbo_result(seeds)
+    won = result >= target
+    win_amt, _ = fair_settle(user_id, "limbo", f"Limbo ({target:.2f}x)", "🚀", "Limbo", bet_inr, target, won, gid, {"result": result})
+
+    chance = min(100.0, FAIR_RTP / target * 100)
+    text_out = (
+        f"🚀 *Limbo* (`{gid}`)\n\n"
+        f"🎯 Target: *{target:.2f}x* (win chance {chance:.2f}%)\n"
+        f"📈 Result: *{result:.2f}x*\n"
+        f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
+    )
+    if won:
+        text_out += f"🎉 *You WON {format_money(win_amt, user_id)}*! 🥳"
+    else:
+        text_out += "😢 *You Lost!*"
+    text_out += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(seeds)
+    payload = {"kind": "limbo", "owner_id": user_id, "bet": bet_inr, "target": target}
+    sent = send_message(chat_id, text_out, reply_markup=create_post_match_keyboard(user_id, payload), reply_to_message_id=reply_to_message_id)
+    remember_button_owner(chat_id, sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None, user_id)
+
+
+# ---------------- MINES ----------------
+def mines_keyboard(game):
+    rows = []
+    for r in range(5):
+        row = []
+        for c in range(5):
+            idx = r * 5 + c
+            if idx in game["revealed"]:
+                row.append({"text": "💎", "callback_data": "mn_x"})
+            else:
+                row.append({"text": "🟦", "callback_data": f"mn_t_{idx}"})
+        rows.append(row)
+    picks = len(game["revealed"])
+    ctrl = [{"text": "🎲 Random", "callback_data": "mn_rand"}]
+    if picks > 0:
+        mult = pf_mines_multiplier(game["mines"], picks)
+        ctrl.append({"text": f"💰 Cashout {fmt_mult(mult)}", "callback_data": "mn_cash"})
+    rows.append(ctrl)
+    return {"inline_keyboard": rows}
+
+def mines_status_text(game, user_id):
+    picks = len(game["revealed"])
+    cur = pf_mines_multiplier(game["mines"], picks)
+    nxt = pf_mines_multiplier(game["mines"], picks + 1) if picks < MINES_TILES - game["mines"] else cur
+    return (
+        f"💣 *Mines* (`{game['game_id']}`)\n\n"
+        f"💣 Mines: *{game['mines']}* | 💎 Found: *{picks}*\n"
+        f"💰 Bet: {format_money(game['bet'], user_id)}\n"
+        f"📈 Current: *{fmt_mult(cur)}* → Next: *{fmt_mult(nxt)}*\n\n"
+        "Pick a tile:" + fair_footer(game["seeds"])
+    )
+
+def mines_final_grid(game, hit_idx=None):
+    lines = []
+    for r in range(5):
+        cells = []
+        for c in range(5):
+            idx = r * 5 + c
+            if idx == hit_idx:
+                cells.append("💥")
+            elif idx in game["layout"]:
+                cells.append("💣")
+            elif idx in game["revealed"]:
+                cells.append("💎")
+            else:
+                cells.append("▫️")
+        lines.append("".join(cells))
+    return "\n".join(lines)
+
+def start_mines_game(chat_id, user_id, bet_inr, mines, reply_to_message_id=None):
+    if not fair_validate_bet(chat_id, user_id, bet_inr, "/mines 50 3"):
+        return
+    gid = generate_game_id()
+    user_balances[user_id] = float(user_balances.get(user_id, 0.0)) - bet_inr
+    persist_user(user_id)
+    seeds = fair_take_seeds(user_id)
+    register_game_record(gid, "mines", user_id, bet_inr, meta=dict(fair_meta(seeds), chat_id=chat_id, mines=mines), refund_on_cancel=True)
+    game = {
+        "game_id": gid, "chat_id": chat_id, "message_id": None, "bet": bet_inr,
+        "mines": mines, "seeds": seeds, "layout": set(pf_mines_layout(seeds, mines)), "revealed": [],
+    }
+    active_mines_games[user_id] = game
+    sent = send_message(chat_id, mines_status_text(game, user_id), reply_markup=mines_keyboard(game), reply_to_message_id=reply_to_message_id)
+    msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+    game["message_id"] = msg_id
+    remember_button_owner(chat_id, msg_id, user_id)
+
+def finish_mines_game(user_id, game, won, hit_idx=None):
+    active_mines_games.pop(user_id, None)
+    picks = len(game["revealed"])
+    mult = pf_mines_multiplier(game["mines"], picks) if won else 0.0
+    win_amt, _ = fair_settle(user_id, "mines", f"Mines ({game['mines']}💣)", "💣", "Mines", game["bet"], mult, won,
+                             game["game_id"], {"picks": picks, "revealed": list(game["revealed"])})
+    head = (
+        f"💣 *Mines Result* (`{game['game_id']}`)\n\n"
+        f"{mines_final_grid(game, hit_idx)}\n\n"
+        f"💣 Mines: *{game['mines']}* | 💎 Found: *{picks}*\n"
+        f"💰 Bet: {format_money(game['bet'], user_id)}\n\n"
+    )
+    if won:
+        body = f"🎉 *Cashed out {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳"
+    else:
+        body = "💥 *Boom! You hit a mine.*"
+    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(game["seeds"])
+    payload = {"kind": "mines", "owner_id": user_id, "bet": game["bet"], "mines": game["mines"]}
+    edit_message(game["chat_id"], game["message_id"], head + body, reply_markup=create_post_match_keyboard(user_id, payload))
+
+def handle_mines_callback(user_id, chat_id, message_id, data):
+    game = active_mines_games.get(user_id)
+    if not game:
+        if data != "mn_x":
+            edit_message(chat_id, message_id, "⚠️ Mines session expired. Start a new game with `/mines <amount> <mines>`.")
+        return
+    if game.get("message_id") is None:
+        game["message_id"] = message_id
+    if data == "mn_x":
+        return
+    if data == "mn_cash":
+        if game["revealed"]:
+            finish_mines_game(user_id, game, True)
+        return
+    if data == "mn_rand":
+        hidden = [i for i in range(MINES_TILES) if i not in game["revealed"]]
+        idx = _pf_secrets.choice(hidden)
+    else:
+        try:
+            idx = int(data.replace("mn_t_", "", 1))
+        except ValueError:
+            return
+        if idx < 0 or idx >= MINES_TILES or idx in game["revealed"]:
+            return
+    if idx in game["layout"]:
+        finish_mines_game(user_id, game, False, hit_idx=idx)
+        return
+    game["revealed"].append(idx)
+    if len(game["revealed"]) >= MINES_TILES - game["mines"]:
+        finish_mines_game(user_id, game, True)
+        return
+    edit_message(game["chat_id"], game["message_id"], mines_status_text(game, user_id), reply_markup=mines_keyboard(game))
+
+
+# ---------------- TOWER ----------------
+def tower_keyboard(game):
+    cfg = TOWER_DIFFICULTIES[game["difficulty"]]
+    level = len(game["picks"])
+    rows = []
+    for lvl in range(TOWER_LEVELS - 1, -1, -1):
+        row = []
+        for c in range(cfg["cols"]):
+            if lvl < level:
+                txt = "✅" if game["picks"][lvl] == c else "⬛"
+                row.append({"text": txt, "callback_data": "tw_x"})
+            elif lvl == level:
+                row.append({"text": f"❓ {fmt_mult(pf_tower_multiplier(game['difficulty'], lvl + 1))}", "callback_data": f"tw_p_{c}"})
+            else:
+                row.append({"text": "⬛", "callback_data": "tw_x"})
+        rows.append(row)
+    ctrl = [{"text": "🎲 Random", "callback_data": "tw_rand"}]
+    if level > 0:
+        ctrl.append({"text": f"💰 Cashout {fmt_mult(pf_tower_multiplier(game['difficulty'], level))}", "callback_data": "tw_cash"})
+    rows.append(ctrl)
+    return {"inline_keyboard": rows}
+
+def tower_status_text(game, user_id):
+    level = len(game["picks"])
+    cfg = TOWER_DIFFICULTIES[game["difficulty"]]
+    return (
+        f"🗼 *Tower* (`{game['game_id']}`)\n\n"
+        f"⚙️ Mode: *{game['difficulty'].title()}* ({cfg['cols']} tiles, {cfg['bombs']} 💀 per row)\n"
+        f"🪜 Level: *{level}/{TOWER_LEVELS}*\n"
+        f"💰 Bet: {format_money(game['bet'], user_id)}\n"
+        f"📈 Current: *{fmt_mult(pf_tower_multiplier(game['difficulty'], level))}*\n\n"
+        "Climb! Pick a tile on the ❓ row:" + fair_footer(game["seeds"])
+    )
+
+def tower_final_grid(game, hit=None):
+    cfg = TOWER_DIFFICULTIES[game["difficulty"]]
+    lines = []
+    for lvl in range(TOWER_LEVELS - 1, -1, -1):
+        cells = []
+        for c in range(cfg["cols"]):
+            if hit == (lvl, c):
+                cells.append("💥")
+            elif c in game["layout"][lvl]:
+                cells.append("💀")
+            elif lvl < len(game["picks"]) and game["picks"][lvl] == c:
+                cells.append("✅")
+            else:
+                cells.append("🟩")
+        lines.append("".join(cells))
+    return "\n".join(lines)
+
+def start_tower_game(chat_id, user_id, bet_inr, difficulty, reply_to_message_id=None):
+    if not fair_validate_bet(chat_id, user_id, bet_inr, "/tower 50 easy"):
+        return
+    gid = generate_game_id()
+    user_balances[user_id] = float(user_balances.get(user_id, 0.0)) - bet_inr
+    persist_user(user_id)
+    seeds = fair_take_seeds(user_id)
+    register_game_record(gid, "tower", user_id, bet_inr, meta=dict(fair_meta(seeds), chat_id=chat_id, difficulty=difficulty), refund_on_cancel=True)
+    game = {
+        "game_id": gid, "chat_id": chat_id, "message_id": None, "bet": bet_inr,
+        "difficulty": difficulty, "seeds": seeds, "layout": pf_tower_layout(seeds, difficulty), "picks": [],
+    }
+    active_tower_games[user_id] = game
+    sent = send_message(chat_id, tower_status_text(game, user_id), reply_markup=tower_keyboard(game), reply_to_message_id=reply_to_message_id)
+    msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+    game["message_id"] = msg_id
+    remember_button_owner(chat_id, msg_id, user_id)
+
+def finish_tower_game(user_id, game, won, hit=None):
+    active_tower_games.pop(user_id, None)
+    level = len(game["picks"])
+    mult = pf_tower_multiplier(game["difficulty"], level) if won else 0.0
+    win_amt, _ = fair_settle(user_id, "tower", f"Tower ({game['difficulty'].title()})", "🗼", "Tower", game["bet"], mult, won,
+                             game["game_id"], {"levels": level, "picks": list(game["picks"])})
+    head = (
+        f"🗼 *Tower Result* (`{game['game_id']}`)\n\n"
+        f"{tower_final_grid(game, hit)}\n\n"
+        f"⚙️ Mode: *{game['difficulty'].title()}* | 🪜 Level: *{level}/{TOWER_LEVELS}*\n"
+        f"💰 Bet: {format_money(game['bet'], user_id)}\n\n"
+    )
+    if won:
+        body = f"🎉 *Cashed out {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳"
+    else:
+        body = "💀 *Boom! You picked a skull.*"
+    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(game["seeds"])
+    payload = {"kind": "tower", "owner_id": user_id, "bet": game["bet"], "difficulty": game["difficulty"]}
+    edit_message(game["chat_id"], game["message_id"], head + body, reply_markup=create_post_match_keyboard(user_id, payload))
+
+def handle_tower_callback(user_id, chat_id, message_id, data):
+    game = active_tower_games.get(user_id)
+    if not game:
+        if data != "tw_x":
+            edit_message(chat_id, message_id, "⚠️ Tower session expired. Start a new game with `/tower <amount> <mode>`.")
+        return
+    if game.get("message_id") is None:
+        game["message_id"] = message_id
+    if data == "tw_x":
+        return
+    level = len(game["picks"])
+    if data == "tw_cash":
+        if level > 0:
+            finish_tower_game(user_id, game, True)
+        return
+    cols = TOWER_DIFFICULTIES[game["difficulty"]]["cols"]
+    if data == "tw_rand":
+        col = _pf_secrets.randbelow(cols)
+    else:
+        try:
+            col = int(data.replace("tw_p_", "", 1))
+        except ValueError:
+            return
+        if col < 0 or col >= cols:
+            return
+    if col in game["layout"][level]:
+        finish_tower_game(user_id, game, False, hit=(level, col))
+        return
+    game["picks"].append(col)
+    if len(game["picks"]) >= TOWER_LEVELS:
+        finish_tower_game(user_id, game, True)
+        return
+    edit_message(game["chat_id"], game["message_id"], tower_status_text(game, user_id), reply_markup=tower_keyboard(game))
+
+
+# ---------------- VERIFY ----------------
+def build_verify_text(gid):
+    gid = gid.strip().upper()
+    rec = game_id_registry.get(gid)
+    if not rec or rec.get("kind") not in ("mines", "tower", "limbo"):
+        return f"⚠️ No Mines / Tower / Limbo game found with ID `{gid}`."
+    meta = rec.get("meta", {})
+    seed_hash = meta.get("server_seed_hash")
+    server_seed = revealed_server_seeds.get(seed_hash)
+    head = (
+        f"🔍 *Verify* `{gid}` ({rec['kind'].title()})\n\n"
+        f"🔒 Server Seed Hash: `{seed_hash}`\n"
+        f"👤 Client Seed: `{meta.get('client_seed')}`\n"
+        f"🔢 Nonce: `{meta.get('nonce')}`\n"
+    )
+    if not server_seed:
+        return head + "\n⏳ Server seed is still hidden. The owner must tap *Change Seed* in /fair first, then verify again."
+    seeds = {"server_seed": server_seed, "client_seed": meta.get("client_seed"), "nonce": int(meta.get("nonce", 0))}
+    head += f"🔓 Server Seed: `{server_seed}`\n✅ Hash matches: *{'YES' if pf_sha256(server_seed) == seed_hash else 'NO'}*\n\n"
+    link_params = f"server={server_seed}&client={seeds['client_seed']}&nonce={seeds['nonce']}"
+    if rec["kind"] == "limbo":
+        res = pf_limbo_result(seeds)
+        head += f"🚀 Limbo result: *{res:.2f}x* (target {float(meta.get('target', 0)):.2f}x)"
+        link_params = f"game=limbo&{link_params}"
+    elif rec["kind"] == "mines":
+        m = int(meta.get("mines", MINES_DEFAULT))
+        layout = sorted(t + 1 for t in pf_mines_layout(seeds, m))
+        head += f"💣 Mine tiles (1-25, left→right, top→bottom): `{', '.join(map(str, layout))}`"
+        link_params = f"game=mines&mines={m}&{link_params}"
+    else:
+        d = meta.get("difficulty", "easy")
+        layout = pf_tower_layout(seeds, d)
+        rows = " | ".join(f"L{i + 1}:{'/'.join(str(c + 1) for c in row)}" for i, row in enumerate(layout))
+        head += f"💀 Skull tiles per level (bottom→top): `{rows}`"
+        link_params = f"game=tower&difficulty={d}&{link_params}"
+    if VERIFY_URL:
+        head += f"\n\n🌐 Check online: {VERIFY_URL.rstrip('/')}/?{link_params}"
+    return head
+
+
+# ---------------- COMMAND + CALLBACK ROUTERS ----------------
+FAIR_CMD_RE = rf"^/(mines|tower|limbo|fair|setseed|verify)(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)"
+
+def handle_fair_command(chat_id, chat_type, user_id, text, message):
+    m = re.match(FAIR_CMD_RE, text, re.IGNORECASE)
+    cmd = m.group(1).lower()
+    parts = text.split()
+    reply_to = message.get("message_id") if chat_type in ["group", "supergroup"] else None
+
+    if cmd == "fair":
+        sent = send_message(chat_id, build_fair_text(user_id), reply_markup=fair_keyboard())
+        remember_button_owner(chat_id, sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None, user_id)
+        return
+
+    if cmd == "setseed":
+        new_seed = clean_client_seed(parts[1]) if len(parts) > 1 else None
+        if not new_seed:
+            send_message(chat_id, "⚠️ Usage: `/setseed yourtext` (letters, numbers, - only, max 32)")
+            return
+        if has_open_fair_game(user_id):
+            send_message(chat_id, "⚠️ Finish your Mines / Tower game before changing seeds.")
+            return
+        old_seed, old_hash = fair_rotate(user_id, new_seed)
+        send_message(chat_id, f"✅ Client seed set to `{new_seed}`.\n\n🔓 Previous server seed revealed:\n`{old_seed}`\n\n" + build_fair_text(user_id))
+        return
+
+    if cmd == "verify":
+        if len(parts) < 2:
+            send_message(chat_id, "⚠️ Usage: `/verify XC-XXXXXXX-XXXX`")
+            return
+        send_message(chat_id, build_verify_text(parts[1]))
+        return
+
+    bet_inr = parse_user_amount(parts[1], user_id) if len(parts) > 1 else parse_user_amount("10", user_id)
+
+    if cmd == "limbo":
+        try:
+            target = float(parts[2].lower().rstrip("x")) if len(parts) > 2 else 2.0
+        except ValueError:
+            target = None
+        if target is None or target < LIMBO_MIN_TARGET or target > LIMBO_MAX_TARGET:
+            send_message(chat_id, f"⚠️ Target must be {LIMBO_MIN_TARGET:.2f}x – {LIMBO_MAX_TARGET:.0f}x. Example: `/limbo 50 2`")
+            return
+        run_limbo_game(chat_id, user_id, bet_inr, round(target, 2), reply_to_message_id=reply_to)
+    elif cmd == "mines":
+        try:
+            mines = int(parts[2]) if len(parts) > 2 else MINES_DEFAULT
+        except ValueError:
+            mines = None
+        if mines is None or mines < 1 or mines > 24:
+            send_message(chat_id, "⚠️ Mines must be 1–24. Example: `/mines 50 3`")
+            return
+        start_mines_game(chat_id, user_id, bet_inr, mines, reply_to_message_id=reply_to)
+    elif cmd == "tower":
+        diff = parts[2].lower() if len(parts) > 2 else "easy"
+        if diff not in TOWER_DIFFICULTIES:
+            send_message(chat_id, "⚠️ Mode must be `easy`, `medium`, `hard`, `expert` or `master`. Example: `/tower 50 easy`")
+            return
+        start_tower_game(chat_id, user_id, bet_inr, diff, reply_to_message_id=reply_to)
+
+def handle_fair_callback(chat_id, message_id, user_id, data):
+    with get_turn_lock(f"fair_{user_id}"):
+        if data.startswith("mn_"):
+            handle_mines_callback(user_id, chat_id, message_id, data)
+        elif data.startswith("tw_"):
+            handle_tower_callback(user_id, chat_id, message_id, data)
+        elif data == "pf_rotate":
+            if has_open_fair_game(user_id):
+                send_message(chat_id, "⚠️ Finish your Mines / Tower game before changing seeds.")
+                return
+            old_seed, _ = fair_rotate(user_id)
+            edit_message(chat_id, message_id, f"🔓 *Previous server seed revealed:*\n`{old_seed}`\n\n" + build_fair_text(user_id), reply_markup=fair_keyboard())
+
+def restart_fair_game(chat_id, user_id, payload, next_bet):
+    kind = payload.get("kind")
+    if kind == "limbo":
+        run_limbo_game(chat_id, user_id, next_bet, float(payload.get("target", 2.0)))
+    elif kind == "mines":
+        start_mines_game(chat_id, user_id, next_bet, int(payload.get("mines", MINES_DEFAULT)))
+    elif kind == "tower":
+        start_tower_game(chat_id, user_id, next_bet, payload.get("difficulty", "easy"))
+# ===================== END PROVABLY FAIR GAMES =====================
+
 
 @app.route('/')
 def index():
@@ -3172,6 +3882,11 @@ def telegram_webhook():
                         "- `/cancel <game_id>` - Cancel an active game\n"
                         "- `/search <game_id>` - Search game info by ID\n\n"
                         "🃏 *Blackjack:* `/bj 50` (Hit / Stand / Double buttons)\n\n"
+                        "🔐 *Provably Fair Games:*\n"
+                        "• 💣 `/mines 50 3` → 5x5 board, 3 mines (1-24)\n"
+                        "• 🗼 `/tower 50 easy` → easy / medium / hard / expert / master\n"
+                        "• 🚀 `/limbo 50 2` → win if result ≥ your target\n"
+                        "• `/fair` seeds · `/setseed <text>` · `/verify <game_id>`\n\n"
                         "🎮 *Versus Games (`/dice`, `/dart`, `/foot`, `/basket`, `/bowl`)*\n"
                         "• `/dice 50` → Opens menu\n"
                         "• `/dice 50 1r1w` → Auto `normal` mode + direct confirmation\n"
@@ -3240,6 +3955,10 @@ def telegram_webhook():
                             chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=raw_choice,
                             reply_to_message_id=message.get('message_id') if chat_type in ['group', 'supergroup'] else None
                         )
+                    return jsonify({'status': 'ok'}), 200
+
+                elif re.match(FAIR_CMD_RE, text, re.IGNORECASE):
+                    handle_fair_command(chat_id, chat_type, user_id, text, message)
                     return jsonify({'status': 'ok'}), 200
 
                 elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
@@ -3673,7 +4392,7 @@ def telegram_webhook():
 
             answer_callback(callback_query_id)
             
-            if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_") and not callback_data.startswith("infopg_") and not callback_data.startswith("myhistpg_"):
+            if not callback_data.startswith(("mn_", "tw_", "pf_")) and not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_") and not callback_data.startswith("infopg_") and not callback_data.startswith("myhistpg_"):
                 remove_inline_keyboard(chat_id, message_id)
             
             register_user_identity(query.get('from'))
@@ -3995,6 +4714,10 @@ def telegram_webhook():
                 schedule_pvp_turn_timeout(target_chat, match_id, active_pvp_games[match_id])
                 return jsonify({'status': 'ok'}), 200
 
+            if callback_data.startswith(("mn_", "tw_", "pf_")):
+                handle_fair_callback(chat_id, message_id, user_id, callback_data)
+                return jsonify({'status': 'ok'}), 200
+
             if callback_data.startswith("bj_"):
                 if user_id not in active_bj_games:
                     edit_message(chat_id, message_id, "⚠️ Blackjack session expired. Start a new game with `/bj <amount>`.")
@@ -4312,6 +5035,8 @@ def zapupi_webhook():
 
 init_db()
 load_all_from_db()
+init_fair_db()
+load_fair_from_db()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
