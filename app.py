@@ -40,6 +40,7 @@ withdrawal_history = []
 banned_users = set()
 
 active_games = {}
+active_7up_games = {}
 pending_game_setup = {}
 open_pvp_challenges = {}
 active_pvp_games = {}
@@ -52,6 +53,31 @@ def get_turn_lock(lock_key):
     if lock_key not in turn_locks:
         turn_locks[lock_key] = threading.Lock()
     return turn_locks[lock_key]
+
+def get_active_game_summary(user_id):
+    if user_id in active_7up_games:
+        g7 = active_7up_games[user_id]
+        gid = g7.get("game_id")
+        return f"7Up (`{gid}`)" if gid else "7Up"
+    if user_id in active_bj_games:
+        gbj = active_bj_games[user_id]
+        gid = gbj.get("game_id")
+        return f"Blackjack (`{gid}`)" if gid else "Blackjack"
+    if user_id in active_games:
+        ref = active_games[user_id]
+        if isinstance(ref, str) and ref in active_pvp_games:
+            pvm = active_pvp_games[ref]
+            gid = pvm.get("game_id") or ref
+            return f"PvP Match (`{gid}`)"
+        if isinstance(ref, dict):
+            gid = ref.get("game_id")
+            emoji = ref.get("emoji", "🎮")
+            return f"{emoji} Versus Match (`{gid}`)" if gid else f"{emoji} Versus Match"
+        return "an active match"
+    return None
+
+def is_player_in_active_game(user_id):
+    return get_active_game_summary(user_id) is not None
 
 def schedule_pvb_turn_timeout(chat_id, user_id, game):
     token = uuid.uuid4().hex
@@ -333,6 +359,7 @@ def execute_manual_txn(entry):
             send_message(origin_chat_id, f"✅ Sent *{amt_for_sender}* tip to {display_sender_label(receiver_id)}!")
         if prompt_chat_id != origin_chat_id:
             send_message(prompt_chat_id, f"✅ Tip confirmed: *{amt_for_sender}* sent to {display_sender_label(receiver_id)}.")
+
 game_id_registry = {}
 deposit_states = {}
 withdrawal_states = {}
@@ -358,6 +385,13 @@ GAME_MULTIPLIERS = {
     "bj": 1.94,
     "dr": 1.92,
     "dr_nums": {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15},
+    "7up": {
+        "up": 2.16,
+        "down": 2.16,
+        "odd": 1.9,
+        "even": 1.9,
+        "7": 5.16,
+    },
 }
 
 EMOJI_TO_MULT_KEY = {
@@ -387,6 +421,147 @@ GAME_NAME_MAP = {
     "🏀": "Basketball",
     "🎳": "Bowling",
 }
+
+def normalize_7up_choice(raw_choice):
+    if raw_choice is None:
+        return None
+    c = str(raw_choice).strip().lower()
+    if c in ("up", "high"):
+        return "up"
+    if c in ("down", "low"):
+        return "down"
+    if c == "odd":
+        return "odd"
+    if c == "even":
+        return "even"
+    if c == "7":
+        return "7"
+    return None
+
+def format_7up_choice_label(canonical_choice):
+    labels = {
+        "up": "UP / HIGH (8–12)",
+        "down": "DOWN / LOW (2–6)",
+        "odd": "ODD",
+        "even": "EVEN",
+        "7": "EXACT 7",
+    }
+    return labels.get(canonical_choice, canonical_choice.upper())
+
+def evaluate_7up_outcome(canonical_choice, total_val):
+    if canonical_choice == "up":
+        return 8 <= total_val <= 12
+    if canonical_choice == "down":
+        return 2 <= total_val <= 6
+    if canonical_choice == "odd":
+        return (total_val % 2) == 1
+    if canonical_choice == "even":
+        return (total_val % 2) == 0
+    if canonical_choice == "7":
+        return total_val == 7
+    return False
+
+def get_7up_multiplier(canonical_choice):
+    mult_map = GAME_MULTIPLIERS.get("7up") or {}
+    defaults = {"up": 2.16, "down": 2.16, "odd": 1.9, "even": 1.9, "7": 5.16}
+    return float(mult_map.get(canonical_choice, defaults.get(canonical_choice, 1.0)))
+
+def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=None):
+    global HOUSE_BALANCE
+    gid = generate_game_id()
+    current_bal = float(user_balances.get(user_id, 0.0))
+    user_balances[user_id] = current_bal - bet_inr
+    persist_user(user_id)
+
+    active_7up_games[user_id] = {
+        "game_id": gid,
+        "chat_id": chat_id,
+        "bet": bet_inr,
+        "choice": canonical_choice,
+        "raw_choice": raw_choice_text or canonical_choice,
+    }
+
+    try:
+        register_game_record(
+            gid,
+            "seven_up",
+            user_id,
+            bet_inr,
+            meta={"choice": canonical_choice, "raw_choice": raw_choice_text or canonical_choice},
+            refund_on_cancel=True
+        )
+        choice_disp = format_7up_choice_label(canonical_choice)
+        mult = get_7up_multiplier(canonical_choice)
+        send_message(
+            chat_id,
+            f"🎲🎲 *7Up Rolling!* (`{gid}`)\n"
+            f"🎯 Pick: *{choice_disp}* (`{fmt_mult(mult)}`)\n"
+            f"💰 Bet: *{format_money(bet_inr, user_id)}*"
+        )
+
+        res1 = send_animated_game(chat_id, "🎲")
+        d1 = res1["result"]["dice"]["value"] if res1 and "result" in res1 else random.randint(1, 6)
+        time.sleep(0.6)
+        res2 = send_animated_game(chat_id, "🎲")
+        d2 = res2["result"]["dice"]["value"] if res2 and "result" in res2 else random.randint(1, 6)
+        time.sleep(0.8)
+
+        total_val = d1 + d2
+        parity_str = "Even" if total_val % 2 == 0 else "Odd"
+        is_win = evaluate_7up_outcome(canonical_choice, total_val)
+
+        result_text = (
+            f"🎲🎲 *7Up Result* (`{gid}`)\n\n"
+            f"🎯 Dice 1: *{d1}* | Dice 2: *{d2}*\n"
+            f"➕ Combined Total: *{total_val}* ({parity_str})\n"
+            f"📌 Your Pick: *{choice_disp}*\n\n"
+        )
+
+        if is_win:
+            win_amt = bet_inr * mult
+            profit_inr = win_amt - bet_inr
+            user_balances[user_id] = float(user_balances.get(user_id, 0.0)) + win_amt
+            HOUSE_BALANCE -= profit_inr
+            persist_user(user_id)
+            save_config_value("house_balance", HOUSE_BALANCE)
+            update_user_stats(user_id, "7up", bet_inr, profit_inr, True)
+            record_user_bet(user_id, f"7Up ({choice_disp})", bet_inr, profit_inr, "WON", game_id=gid)
+            mark_game_finished(
+                gid,
+                "completed",
+                extra_meta={"outcome": "WON", "d1": d1, "d2": d2, "total": total_val, "pnl": profit_inr}
+            )
+            log_win_to_channel(user_id, "🎲", "7Up", win_amt, fmt_mult(mult))
+            result_text += (
+                f"🎉 *You WON {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳\n"
+                f"💰 Balance: *{format_money(user_balances[user_id], user_id)}*"
+            )
+        else:
+            profit_inr = -bet_inr
+            HOUSE_BALANCE += bet_inr
+            persist_user(user_id)
+            save_config_value("house_balance", HOUSE_BALANCE)
+            update_user_stats(user_id, "7up", bet_inr, profit_inr, False)
+            record_user_bet(user_id, f"7Up ({choice_disp})", bet_inr, profit_inr, "LOST", game_id=gid)
+            mark_game_finished(
+                gid,
+                "completed",
+                extra_meta={"outcome": "LOST", "d1": d1, "d2": d2, "total": total_val, "pnl": profit_inr}
+            )
+            result_text += (
+                f"😢 *You Lost!* Better luck next time.\n"
+                f"💰 Balance: *{format_money(user_balances[user_id], user_id)}*"
+            )
+
+        pm_7up_payload = {
+            "kind": "7up",
+            "owner_id": user_id,
+            "bet": bet_inr,
+            "choice_7up": canonical_choice,
+        }
+        send_message(chat_id, result_text, reply_markup=create_post_match_keyboard(user_id, pm_7up_payload))
+    finally:
+        active_7up_games.pop(user_id, None)
 
 import json
 import psycopg2
@@ -659,6 +834,8 @@ def load_all_from_db():
                     for mk, mv in v.items():
                         if mk == "dr_nums" and isinstance(mv, dict):
                             GAME_MULTIPLIERS["dr_nums"].update({int(dk): float(dv) for dk, dv in mv.items()})
+                        elif mk == "7up" and isinstance(mv, dict):
+                            GAME_MULTIPLIERS["7up"].update({str(sk): float(sv) for sk, sv in mv.items()})
                         else:
                             GAME_MULTIPLIERS[mk] = float(mv)
 
@@ -1278,7 +1455,6 @@ def get_user_total_wager(uid):
     st = user_stats.get(uid) or {}
     if "total_wager" in st and st["total_wager"] is not None:
         return float(st["total_wager"])
-    # Fallback to bet logs if total_wager not yet populated on older records
     logs = user_bet_logs.get(uid) or []
     if logs:
         return sum(float(item.get("bet", 0.0)) for item in logs)
@@ -1312,13 +1488,11 @@ def generate_top_wagerers_image(viewer_id=None):
     img = Image.new("RGB", (width, height), color=(14, 17, 29))
     d = ImageDraw.Draw(img)
 
-    # Header banner
     d.rectangle([0, 0, width, 84], fill=(28, 34, 58))
     d.rectangle([0, 82, width, 86], fill=(255, 198, 41))
     d.text((28, 18), "🏆 TOP 10 WAGERERS LEADERBOARD", fill=(255, 215, 64))
     d.text((28, 48), f"{BOT_USERNAME}  •  Total Volume (All Time)", fill=(185, 198, 230))
 
-    # Column headers
     y_hdr = 100
     d.text((28, y_hdr), "RANK", fill=(140, 155, 190))
     d.text((115, y_hdr), "PLAYER", fill=(140, 155, 190))
@@ -1340,13 +1514,10 @@ def generate_top_wagerers_image(viewer_id=None):
             d.rounded_rectangle([22, ry, width - 22, ry + row_h - 4], radius=8, fill=bg_col)
 
             rank_txt = f"#{idx}"
-            if idx in medals:
-                rank_txt = f"#{idx}"
             rank_col = (255, 215, 64) if idx == 1 else ((210, 218, 235) if idx <= 3 else (155, 170, 200))
             name_col = (255, 225, 105) if idx == 1 else (238, 242, 250)
             wager_col = (72, 245, 155) if idx <= 3 else (110, 215, 255)
 
-            # Display wager in viewer's currency if set, otherwise INR
             curr = user_currency.get(viewer_id, "INR") if viewer_id else "INR"
             if curr == "USDT" and EXCHANGE_RATE > 0:
                 w_disp = f"${row['wager_inr'] / EXCHANGE_RATE:,.2f}"
@@ -1396,12 +1567,9 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         )
         return
 
-    # Prevent starting overlapping active games
-    if kind == "versus" and user_id in active_games:
-        answer_callback(callback_query_id, "Finish your current active game first!")
-        return
-    if kind == "bj" and user_id in active_bj_games:
-        answer_callback(callback_query_id, "Finish your active Blackjack hand first!")
+    active_summary = get_active_game_summary(user_id)
+    if active_summary:
+        answer_callback(callback_query_id, f"Finish your active {active_summary} game first!")
         return
 
     fresh_bal = float(user_balances.get(user_id, 0.0))
@@ -1412,7 +1580,6 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         )
         return
 
-    # Remove buttons from the old result message so it cannot be re-used
     remove_inline_keyboard(chat_id, message_id)
 
     if kind == "versus":
@@ -1428,6 +1595,11 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
             game_id=gid
         )
         answer_callback(callback_query_id, f"Started {format_money(next_bet, user_id)} match!")
+
+    elif kind == "7up":
+        choice_7up = normalize_7up_choice(payload.get("choice_7up")) or "up"
+        answer_callback(callback_query_id, f"Rolling 7Up ({format_money(next_bet, user_id)})!")
+        run_7up_game(chat_id, user_id, next_bet, choice_7up, raw_choice_text=payload.get("choice_7up"))
 
     elif kind == "bj":
         global HOUSE_BALANCE
@@ -1698,7 +1870,8 @@ def build_game_search_report(target_gid):
         "bot_versus": "🤖 Bot Versus",
         "pvp_match": "⚔️ Player vs Player",
         "blackjack": "🃏 Blackjack",
-        "prediction": "🔮 Dice Prediction"
+        "prediction": "🔮 Dice Prediction",
+        "seven_up": "🎲🎲 7Up",
     }
     kind_str = kind_labels.get(rec.get("kind"), rec.get("kind", "Game"))
     status_str = str(rec.get("status", "unknown")).upper()
@@ -1791,6 +1964,11 @@ def cancel_game_by_id(target_gid):
     elif kind == "blackjack":
         bj = active_bj_games.pop(owner_id, None)
         effective_bet = (bj or {}).get("bet", bet_inr)
+        if refund and effective_bet > 0:
+            user_balances[owner_id] = user_balances.get(owner_id, 0.0) + effective_bet
+    elif kind == "seven_up":
+        g7 = active_7up_games.pop(owner_id, None)
+        effective_bet = (g7 or {}).get("bet", bet_inr)
         if refund and effective_bet > 0:
             user_balances[owner_id] = user_balances.get(owner_id, 0.0) + effective_bet
     elif kind == "prediction":
@@ -2587,6 +2765,40 @@ def telegram_webhook():
                         send_message(chat_id, "⚠️ Enter a valid positive multiplier (e.g. `1.94`, `1.9`, `2`).")
                     return jsonify({'status': 'ok'}), 200
 
+                seven_up_mult_cmd_map = {
+                    "/setmulti7upup": "up",
+                    "/setmultihigh": "up",
+                    "/setmulti7updown": "down",
+                    "/setmultilow": "down",
+                    "/setmulti7upodd": "odd",
+                    "/setmulti7upeven": "even",
+                    "/setmulti7up7": "7",
+                }
+                matched_7up_key = None
+                for cmd_prefix, s_key in seven_up_mult_cmd_map.items():
+                    if re.match(rf"^{re.escape(cmd_prefix)}(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                        matched_7up_key = s_key
+                        break
+
+                if matched_7up_key:
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split()
+                    if len(parts) < 2:
+                        cur_m = get_7up_multiplier(matched_7up_key)
+                        send_message(chat_id, f"⚙️ Current `7up` (`{matched_7up_key}`) multiplier: *{fmt_mult(cur_m)}*\nUsage: `{parts[0]} <multiplier>`")
+                        return jsonify({'status': 'ok'}), 200
+                    try:
+                        new_val = float(parts[1])
+                        if new_val <= 0 or new_val > 100:
+                            raise ValueError()
+                        GAME_MULTIPLIERS.setdefault("7up", {})[matched_7up_key] = new_val
+                        send_message(chat_id, f"✅ Updated `7up` (`{matched_7up_key}`) multiplier to *{fmt_mult(new_val)}*.")
+                    except ValueError:
+                        send_message(chat_id, "⚠️ Enter a valid positive multiplier (e.g. `2.16`, `1.9`, `5.16`).")
+                    return jsonify({'status': 'ok'}), 200
+
                 if re.match(rf"^/setmultidrnum(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
                         send_message(chat_id, "⛔ Unauthorized.")
@@ -2611,6 +2823,7 @@ def telegram_webhook():
                         send_message(chat_id, "⛔ Unauthorized.")
                         return jsonify({'status': 'ok'}), 200
                     dr_nums_str = ", ".join(f"{k}n: {fmt_mult(v)}" for k, v in GAME_MULTIPLIERS["dr_nums"].items())
+                    m7 = GAME_MULTIPLIERS.get("7up", {})
                     txt = (
                         "⚙️ *Active Game Multipliers*\n\n"
                         f"• Dice: *{fmt_mult(GAME_MULTIPLIERS['dice'])}*\n"
@@ -2621,7 +2834,8 @@ def telegram_webhook():
                         f"• PvP: *{fmt_mult(GAME_MULTIPLIERS['pvp'])}*\n"
                         f"• Blackjack: *{fmt_mult(GAME_MULTIPLIERS['bj'])}*\n"
                         f"• Predict (H/L/O/E): *{fmt_mult(GAME_MULTIPLIERS['dr'])}*\n"
-                        f"• Predict Numbers: `{dr_nums_str}`"
+                        f"• Predict Numbers: `{dr_nums_str}`\n"
+                        f"• 7Up: `up/high: {fmt_mult(m7.get('up', 2.16))}, down/low: {fmt_mult(m7.get('down', 2.16))}, odd: {fmt_mult(m7.get('odd', 1.9))}, even: {fmt_mult(m7.get('even', 1.9))}, 7: {fmt_mult(m7.get('7', 5.16))}`"
                     )
                     send_message(chat_id, txt)
                     return jsonify({'status': 'ok'}), 200
@@ -2763,7 +2977,9 @@ def telegram_webhook():
                         "• `/dice 50 1r1w` → Auto `normal` mode + direct confirmation\n"
                         "• `/dice 50 1r1w crazy` → `crazy` mode + direct confirmation\n\n"
                         "🔮 *Prediction Game (`/dr`):*\n"
-                        "- `/dr 50 high` or `/dr 50 2,4,6`"
+                        "- `/dr 50 high` or `/dr 50 2,4,6`\n\n"
+                        "🎲🎲 *7Up Game (`/7up`):*\n"
+                        "- `/7up 50 up` (`high`), `/7up 50 down` (`low`), `/7up 50 odd`, `/7up 50 even`, `/7up 50 7`"
                     )
                     send_message(chat_id, help_text)
 
@@ -2780,9 +2996,53 @@ def telegram_webhook():
                     send_message(chat_id, hist_text, reply_markup=hist_kb)
                     return jsonify({'status': 'ok'}), 200
 
+                elif re.match(rf"^/7up(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    active_summary = get_active_game_summary(user_id)
+                    if active_summary:
+                        send_message(chat_id, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
+                        return jsonify({'status': 'ok'}), 200
+
+                    tokens = text.split()[1:]
+                    bet_inr = None
+                    canonical_choice = None
+                    raw_choice = None
+
+                    for tok in tokens:
+                        norm_c = normalize_7up_choice(tok)
+                        if norm_c is not None and canonical_choice is None:
+                            canonical_choice = norm_c
+                            raw_choice = tok
+                        elif bet_inr is None:
+                            parsed = parse_user_amount(tok, user_id)
+                            if parsed is not None:
+                                bet_inr = parsed
+
+                    if canonical_choice is None or bet_inr is None:
+                        send_message(
+                            chat_id,
+                            "⚠️ Usage: `/7up <amount> <up/high | down/low | odd | even | 7>`\n"
+                            "Example: `/7up 50 up` or `/7up 50 7`"
+                        )
+                        return jsonify({'status': 'ok'}), 200
+
+                    current_bal = float(user_balances.get(user_id, 0.0))
+                    if bet_inr <= 0:
+                        send_message(chat_id, "⚠️ Enter a valid bet amount.")
+                    elif bet_inr < MIN_BET or bet_inr > MAX_BET:
+                        send_message(chat_id, f"⚠️ Bet out of limits! Min: {format_money(MIN_BET, user_id)} | Max: {format_money(MAX_BET, user_id)}")
+                    elif current_bal < bet_inr:
+                        send_message(
+                            chat_id,
+                            f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
+                        )
+                    else:
+                        run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=raw_choice)
+                    return jsonify({'status': 'ok'}), 200
+
                 elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
-                    if user_id in active_bj_games:
-                        send_message(chat_id, "⚠️ You already have an active Blackjack hand! Use the buttons on your current game message.")
+                    active_summary = get_active_game_summary(user_id)
+                    if active_summary:
+                        send_message(chat_id, f"⚠️ You already have an active game (*{active_summary}*)! Finish it before starting a new game.")
                         return jsonify({'status': 'ok'}), 200
 
                     parts = text.split()
@@ -2935,6 +3195,11 @@ def telegram_webhook():
                         send_message(chat_id, "⛔ Unauthorized.")
                         
                 elif text.startswith('/dr '):
+                    active_summary = get_active_game_summary(user_id)
+                    if active_summary:
+                        send_message(chat_id, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
+                        return jsonify({'status': 'ok'}), 200
+
                     parts = text.split(' ')
                     current_bal = user_balances.get(user_id, 0.0)
                     if len(parts) == 3 and parts[1].replace('.', '', 1).isdigit():
@@ -3040,6 +3305,11 @@ def telegram_webhook():
                             break
                     
                     if triggered_game:
+                        active_summary = get_active_game_summary(user_id)
+                        if active_summary:
+                            send_message(chat_id, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
+                            return jsonify({'status': 'ok'}), 200
+
                         tokens = text.split()[1:]
                         bet_inr = parse_user_amount("10", user_id)
                         mode = None
@@ -3171,7 +3441,10 @@ def telegram_webhook():
                 if user_id != payload.get("owner_id"):
                     answer_callback(callback_query_id, "Only the player who played this match can use these buttons!")
                     return jsonify({'status': 'ok'}), 200
-                # Pop token before executing so double-clicks cannot spawn duplicate games
+                active_summary = get_active_game_summary(user_id)
+                if active_summary:
+                    answer_callback(callback_query_id, f"Finish your active {active_summary} game first!")
+                    return jsonify({'status': 'ok'}), 200
                 post_match_actions.pop(token, None)
                 factor = 2.0 if is_double else 1.0
                 execute_post_match_restart(chat_id, message_id, user_id, payload, factor, callback_query_id)
@@ -3308,6 +3581,10 @@ def telegram_webhook():
                 conf = pending_game_setup.pop(user_id)
                 target_chat = conf.get("chat_id") or chat_id
                 target_msg = conf.get("message_id") or message_id
+                active_summary = get_active_game_summary(user_id)
+                if active_summary:
+                    edit_message(target_chat, target_msg, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
+                    return jsonify({'status': 'ok'}), 200
                 bet_inr = conf["bet"]
                 gid = conf.get("game_id") or generate_game_id()
                 current_bal = user_balances.get(user_id, 0.0)
@@ -3334,6 +3611,11 @@ def telegram_webhook():
 
                 if target_chat_type == "private":
                     edit_message(target_chat, target_msg, "❌ Against Player is only available in groups!")
+                    return jsonify({'status': 'ok'}), 200
+
+                active_summary = get_active_game_summary(user_id)
+                if active_summary:
+                    edit_message(target_chat, target_msg, f"⚠️ You are already playing *{active_summary}*! Finish it before starting a PvP challenge.")
                     return jsonify({'status': 'ok'}), 200
 
                 bet_inr = conf["bet"]
@@ -3415,6 +3697,21 @@ def telegram_webhook():
                 host_id = ch["host_id"]
                 if user_id == host_id:
                     answer_callback(callback_query_id, "You cannot accept your own challenge!")
+                    return jsonify({'status': 'ok'}), 200
+
+                active_summary = get_active_game_summary(user_id)
+                if active_summary:
+                    answer_callback(callback_query_id, f"Finish your active {active_summary} game first!")
+                    return jsonify({'status': 'ok'}), 200
+
+                host_active = get_active_game_summary(host_id)
+                if host_active:
+                    if ch.get("game_id"):
+                        mark_game_finished(ch["game_id"], "cancelled")
+                    open_pvp_challenges.pop(cid, None)
+                    target_chat = ch.get("chat_id") or chat_id
+                    target_msg = ch.get("message_id") or message_id
+                    edit_message(target_chat, target_msg, f"⚠️ Challenger is already in *{host_active}*. Challenge cancelled.")
                     return jsonify({'status': 'ok'}), 200
 
                 bet_inr = ch["bet"]
