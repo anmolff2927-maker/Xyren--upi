@@ -2204,6 +2204,39 @@ def create_zapupi_order(amount, chat_id):
     except Exception:
         return "⚠️ Failed to connect to payment gateway.", None
 
+def build_pvb_round_text(user_id, emoji, u_vals, b_vals, round_winner, game, gid, round_num):
+    """PvB round result. round_winner: 'user', 'bot' or None (tie)."""
+    if round_winner == "user":
+        winner_line = f"🔥 Winner: {tag_player(user_id)}"
+    elif round_winner == "bot":
+        winner_line = "🔥 Winner: Bot"
+    else:
+        winner_line = "🤝 Round Tied — no point"
+    return (
+        f"⚔️ *Round {round_num} Result*\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{emoji} {tag_player(user_id)} — {roll_text(u_vals)}{' ✅' if round_winner == 'user' else ''}\n"
+        f"{emoji} Bot — {roll_text(b_vals)}{' ✅' if round_winner == 'bot' else ''}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{winner_line}\n"
+        f"🏆 Score: {game['user_wins']} : {game['bot_wins']} | First to {game['target_wins']}\n"
+        f"🆔 `{gid}`"
+    )
+
+def build_pvb_final_text(user_id, emoji, u_vals, b_vals, user_won, game, gid, win_amt, mult):
+    """PvB final result. Multiplier is read live, so /setmulti changes show here."""
+    return (
+        f"⚔️ *Final Round Result*\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{emoji} {tag_player(user_id)} — {roll_text(u_vals)}{' ✅' if user_won else ''}\n"
+        f"{emoji} Bot — {roll_text(b_vals)}{'' if user_won else ' ✅'}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🔥 Winner: {tag_player(user_id) if user_won else 'Bot'}\n"
+        f"🏆 Score: {game['user_wins']} : {game['bot_wins']} | First to {game['target_wins']}\n"
+        f"🆔 `{gid}`\n"
+        f"🏁 Winnings: {format_money(win_amt, user_id)} ({fmt_mult(mult)})"
+    )
+
 def resolve_round_and_match(chat_id, user_id, game):
     global HOUSE_BALANCE
     gid = game.get("game_id")
@@ -2225,20 +2258,25 @@ def resolve_round_and_match(chat_id, user_id, game):
     round_num = game["round_num"]
     mode_tag = "🔥 CRAZY" if mode == "crazy" else "⚡ NORMAL"
     
+    round_winner = None
     if u_sum == b_sum:
         r_status = "🤝 *Round Tied!* No point awarded."
     elif mode == "crazy":
         if u_sum < b_sum:
+            round_winner = "user"
             game["user_wins"] += 1
             r_status = "✨ *You took this round!* (Lower sum wins)"
         else:
+            round_winner = "bot"
             game["bot_wins"] += 1
             r_status = "🤖 *Bot took this round!* (Lower sum wins)"
     else:
         if u_sum > b_sum:
+            round_winner = "user"
             game["user_wins"] += 1
             r_status = "✨ *You took this round!* (Higher sum wins)"
         else:
+            round_winner = "bot"
             game["bot_wins"] += 1
             r_status = "🤖 *Bot took this round!* (Higher sum wins)"
 
@@ -2266,13 +2304,7 @@ def resolve_round_and_match(chat_id, user_id, game):
                 }
             )
             log_win_to_channel(user_id, emoji, g_name, win_amt, fmt_mult(mult))
-            final_text = (
-                f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
-                f"👤 You: `{u_expr}` = *{u_sum}*\n"
-                f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
-                f"🎉 *Congratulations! You won the match!* ✨\n"
-                f"🎁 *Winnings:* *{format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)"
-            )
+            final_text = build_pvb_final_text(user_id, emoji, u_vals, b_vals, True, game, gid, win_amt, mult)
         else:
             profit_inr = -bet
             HOUSE_BALANCE += bet
@@ -2288,12 +2320,7 @@ def resolve_round_and_match(chat_id, user_id, game):
                     "pnl": profit_inr
                 }
             )
-            final_text = (
-                f"🏁 *Final Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
-                f"👤 You: `{u_expr}` = *{u_sum}*\n"
-                f"🤖 Bot: `{b_expr}` = *{b_sum}*\n\n"
-                f"💫 *Well played, but the bot got the better of you this time!* Better luck next round."
-            )
+            final_text = build_pvb_final_text(user_id, emoji, u_vals, b_vals, False, game, gid, 0.0, get_versus_multiplier(emoji))
 
         pm_vs_payload = {
             "kind": "versus",
@@ -2308,13 +2335,7 @@ def resolve_round_and_match(chat_id, user_id, game):
             del active_games[user_id]
         return
 
-    msg = (
-        f"⚔️ *Round {round_num}* (`{gid}` | `{rw_label}` | {mode_tag})\n"
-        f"👤 You: `{u_expr}` = *{u_sum}*\n"
-        f"🤖 Bot: `{b_expr}` = *{b_sum}*\n"
-        f"{r_status}\n"
-        f"🏆 Score — You: *{game['user_wins']}* | Bot: *{game['bot_wins']}* (First to *{target_wins}*)"
-    )
+    msg = build_pvb_round_text(user_id, emoji, u_vals, b_vals, round_winner, game, gid, round_num)
     send_message(chat_id, msg)
 
     game["round_num"] += 1
@@ -2328,7 +2349,7 @@ def resolve_round_and_match(chat_id, user_id, game):
         b_next = roll_bot_series(chat_id, emoji, rolls_per_round)
         game["current_bot_rolls"] = b_next
         b_next_expr = "+".join(map(str, b_next))
-        send_message(chat_id, f"🤖 Bot Roll: `{b_next_expr}` (*{sum(b_next)}*)\n\n👉 *Now your turn! Send `{emoji}` x{rolls_per_round} in chat.*")
+        send_message(chat_id, f"🤖 Bot Roll: `{b_next_expr}` (*{sum(b_next)}*)\n\n👉 *Now* {tag_player(user_id)}*'s turn! Send `{emoji}` x{rolls_per_round} in chat.*")
         schedule_pvb_turn_timeout(chat_id, user_id, game)
     else:
         game["step"] = "waiting_user_first"
@@ -4183,7 +4204,7 @@ def telegram_webhook():
                     game["current_bot_rolls"] = b_vals
                     b_expr = "+".join(map(str, b_vals))
                     
-                    send_message(chat_id, f"🤖 Bot Rolls: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now your turn! Please send `{emoji}` x{rolls_needed} in chat.*")
+                    send_message(chat_id, f"🤖 Bot Roll: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now* {tag_player(user_id)}*'s turn! Send `{emoji}` x{rolls_needed} in chat.*")
                     schedule_pvb_turn_timeout(chat_id, user_id, game)
                 
         return jsonify({'status': 'ok'}), 200
