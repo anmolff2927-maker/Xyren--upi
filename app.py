@@ -499,7 +499,7 @@ def get_7up_multiplier(canonical_choice):
     defaults = {"up": 2.16, "down": 2.16, "odd": 1.9, "even": 1.9, "7": 5.16}
     return float(mult_map.get(canonical_choice, defaults.get(canonical_choice, 1.0)))
 
-def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=None):
+def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=None, reply_to_message_id=None):
     global HOUSE_BALANCE
     gid = generate_game_id()
     current_bal = float(user_balances.get(user_id, 0.0))
@@ -525,17 +525,10 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
         )
         choice_disp_hist = format_7up_choice_label(canonical_choice, is_win=True)
         mult = get_7up_multiplier(canonical_choice)
-        send_message(
-            chat_id,
-            f"🎲🎲 *7Up Rolling!* (`{gid}`)\n"
-            f"🎯 Pick: *{choice_disp_hist}* (`{fmt_mult(mult)}`)\n"
-            f"💰 Bet: *{format_money(bet_inr, user_id)}*"
-        )
-
-        res1 = send_animated_game(chat_id, "🎲")
+        res1 = send_animated_game(chat_id, "🎲", reply_to_message_id=reply_to_message_id)
         d1 = res1["result"]["dice"]["value"] if res1 and "result" in res1 else random.randint(1, 6)
         time.sleep(0.6)
-        res2 = send_animated_game(chat_id, "🎲")
+        res2 = send_animated_game(chat_id, "🎲", reply_to_message_id=reply_to_message_id)
         d2 = res2["result"]["dice"]["value"] if res2 and "result" in res2 else random.randint(1, 6)
         time.sleep(0.8)
 
@@ -1619,11 +1612,11 @@ def create_post_match_keyboard(user_id, payload):
     last_bet = float(payload.get("bet", 0.0))
     double_bet = last_bet * 2.0
 
-    again_label = f"🔁 Play Again ({format_money(last_bet, user_id)})"
+    again_label = "🔁 Bet Again"
     row1 = [{"text": again_label, "callback_data": f"pm_again_{token}"}]
 
     if double_bet <= MAX_BET:
-        double_label = f"⚡ Bet Double ({format_money(double_bet, user_id)})"
+        double_label = "⚡ Bet Double"
         row1.append({"text": double_label, "callback_data": f"pm_double_{token}"})
 
     return {"inline_keyboard": [row1]}
@@ -1719,7 +1712,6 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         multiplier = 0.0
         win_desc = ""
         if arg in ["high", "low", "odd", "even"]:
-            send_message(chat_id, f"🎲 Rolling dice for Prediction (`{gid}` | *{arg.upper()}* | Bet: {format_money(next_bet, user_id)})...")
             res = send_animated_game(chat_id, "🎲")
             dice_val = res["result"]["dice"]["value"] if res and "result" in res else random.randint(1, 6)
             time.sleep(1)
@@ -1731,7 +1723,6 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
             win_desc = f"Prediction: {arg.upper()}"
         else:
             nums = [int(n.strip()) for n in str(arg).split(",")]
-            send_message(chat_id, f"🎲 Rolling dice for Numbers (`{gid}` | *{nums}* | Bet: {format_money(next_bet, user_id)})...")
             res = send_animated_game(chat_id, "🎲")
             dice_val = res["result"]["dice"]["value"] if res and "result" in res else random.randint(1, 6)
             time.sleep(1)
@@ -2121,6 +2112,7 @@ def send_animated_game(chat_id, emoji, reply_to_message_id=None):
     payload = {"chat_id": chat_id, "emoji": emoji}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
+        payload["allow_sending_without_reply"] = True
     try:
         res = requests.post(url, json=payload, timeout=5)
         return res.json()
@@ -3150,7 +3142,10 @@ def telegram_webhook():
                             f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                         )
                     else:
-                        run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=raw_choice)
+                        run_7up_game(
+                            chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=raw_choice,
+                            reply_to_message_id=message.get('message_id') if chat_type in ['group', 'supergroup'] else None
+                        )
                     return jsonify({'status': 'ok'}), 200
 
                 elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
@@ -3342,9 +3337,7 @@ def telegram_webhook():
                             gid = generate_game_id()
                             user_balances[user_id] = current_bal - bet_inr
                             register_game_record(gid, "prediction", user_id, bet_inr, meta={"choice": arg}, refund_on_cancel=True)
-                            send_message(chat_id, f"🎲 Rolling dice for Prediction (`{gid}` | *{arg.upper()}* | Bet: {format_money(bet_inr, user_id)})...")
-                            
-                            res = send_animated_game(chat_id, '🎲')
+                            res = send_animated_game(chat_id, '🎲', reply_to_message_id=message.get('message_id') if chat_type in ['group', 'supergroup'] else None)
                             dice_val = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
                             time.sleep(1)
                             
@@ -3364,9 +3357,7 @@ def telegram_webhook():
                                 gid = generate_game_id()
                                 user_balances[user_id] = current_bal - bet_inr
                                 register_game_record(gid, "prediction", user_id, bet_inr, meta={"nums": nums}, refund_on_cancel=True)
-                                send_message(chat_id, f"🎲 Rolling dice for Numbers (`{gid}` | *{nums}* | Bet: {format_money(bet_inr, user_id)})...")
-                                
-                                res = send_animated_game(chat_id, '🎲')
+                                res = send_animated_game(chat_id, '🎲', reply_to_message_id=message.get('message_id') if chat_type in ['group', 'supergroup'] else None)
                                 dice_val = res['result']['dice']['value'] if res and 'result' in res else random.randint(1, 6)
                                 time.sleep(1)
                                 
