@@ -1470,6 +1470,14 @@ def remove_inline_keyboard(chat_id, message_id):
     except Exception as e:
         print(f"Error removing keyboard: {e}")
 
+def set_inline_keyboard(chat_id, message_id, reply_markup):
+    url = f"{TELEGRAM_API_URL}/editMessageReplyMarkup"
+    payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
+    try:
+        requests.post(url, json=payload, timeout=3)
+    except Exception as e:
+        print(f"Error setting keyboard: {e}")
+
 def send_photo(chat_id, photo_bio, caption=""):
     url = f"{TELEGRAM_API_URL}/sendPhoto"
     files = {'photo': ('game.png', photo_bio, 'image/png')}
@@ -1728,7 +1736,10 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         )
         return
 
-    remove_inline_keyboard(chat_id, message_id)
+    if kind == "tower" and payload.get("result_grid"):
+        set_inline_keyboard(chat_id, message_id, {"inline_keyboard": payload["result_grid"]})
+    else:
+        remove_inline_keyboard(chat_id, message_id)
 
     if kind == "versus":
         gid = generate_game_id()
@@ -2422,6 +2433,7 @@ import hmac as _pf_hmac
 import hashlib as _pf_hashlib
 import secrets as _pf_secrets
 import math as _pf_math
+from urllib.parse import urlencode as _pf_urlencode
 
 FAIR_HOUSE_EDGE = 0.08          # 8% house edge
 FAIR_RTP = 1.0 - FAIR_HOUSE_EDGE
@@ -2629,8 +2641,28 @@ def fair_rotate(uid, new_client_seed=None):
     persist_fair_seed(uid)
     return old_seed, old_hash
 
-def fair_footer(seeds):
-    return f"\n\n🔐 _Provably Fair_ · Nonce `{seeds['nonce']}` · /fair"
+def fair_link(seeds, kind=None, gid=None, **extra):
+    """Browser link that shows the fairness details of this bet (needs VERIFY_URL)."""
+    if not VERIFY_URL:
+        return None
+    params = {}
+    if kind:
+        params["game"] = kind
+    if gid:
+        params["id"] = gid
+    params["hash"] = pf_sha256(seeds["server_seed"])
+    params["client"] = seeds["client_seed"]
+    params["nonce"] = seeds["nonce"]
+    for k, v in extra.items():
+        if v is not None:
+            params[k] = v
+    return f"{VERIFY_URL.rstrip('/')}/?{_pf_urlencode(params)}"
+
+def fair_footer(seeds, kind=None, gid=None, **extra):
+    link = fair_link(seeds, kind, gid, **extra)
+    if not link:
+        return f"\n\n🔐 _Provably Fair_ · Nonce `{seeds['nonce']}` · /fair"
+    return f"\n\n🔐 [Provably Fair]({link})"
 
 def build_fair_text(uid):
     st = fair_get_state(uid)
@@ -2723,7 +2755,7 @@ def run_limbo_game(chat_id, user_id, bet_inr, target, reply_to_message_id=None):
         text_out += f"🎉 *You WON {format_money(win_amt, user_id)}*! 🥳"
     else:
         text_out += "😢 *You Lost!*"
-    text_out += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(seeds)
+    text_out += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(seeds, "limbo", gid, target=f"{target:.2f}")
     payload = {"kind": "limbo", "owner_id": user_id, "bet": bet_inr, "target": target}
     sent = send_message(chat_id, text_out, reply_markup=create_post_match_keyboard(user_id, payload), reply_to_message_id=reply_to_message_id)
     remember_button_owner(chat_id, sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None, user_id)
@@ -2758,7 +2790,7 @@ def mines_status_text(game, user_id):
         f"💣 Mines: *{game['mines']}* | 💎 Found: *{picks}*\n"
         f"💰 Bet: {format_money(game['bet'], user_id)}\n"
         f"📈 Current: *{fmt_mult(cur)}* → Next: *{fmt_mult(nxt)}*\n\n"
-        "Pick a tile:" + fair_footer(game["seeds"])
+        "Pick a tile:" + fair_footer(game["seeds"], "mines", game["game_id"], mines=game["mines"])
     )
 
 def mines_final_grid(game, hit_idx=None):
@@ -2812,7 +2844,7 @@ def finish_mines_game(user_id, game, won, hit_idx=None):
         body = f"🎉 *Cashed out {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳"
     else:
         body = "💥 *Boom! You hit a mine.*"
-    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(game["seeds"])
+    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(game["seeds"], "mines", game["game_id"], mines=game["mines"])
     payload = {"kind": "mines", "owner_id": user_id, "bet": game["bet"], "mines": game["mines"]}
     edit_message(game["chat_id"], game["message_id"], head + body, reply_markup=create_post_match_keyboard(user_id, payload))
 
@@ -2881,7 +2913,7 @@ def tower_status_text(game, user_id):
         f"🪜 Level: *{level}/{TOWER_LEVELS}*\n"
         f"💰 Bet: {format_money(game['bet'], user_id)}\n"
         f"📈 Current: *{fmt_mult(pf_tower_multiplier(game['difficulty'], level))}*\n\n"
-        "Climb! Pick a tile on the ❓ row:" + fair_footer(game["seeds"])
+        "Climb! Pick a tile on the ❓ row:" + fair_footer(game["seeds"], "tower", game["game_id"], difficulty=game["difficulty"])
     )
 
 def tower_final_grid(game, hit=None):
@@ -2919,25 +2951,45 @@ def start_tower_game(chat_id, user_id, bet_inr, difficulty, reply_to_message_id=
     game["message_id"] = msg_id
     remember_button_owner(chat_id, msg_id, user_id)
 
+def tower_result_rows(game, hit=None):
+    """Final tower as buttons: 🐍 = skull tile, 🥚 = safe tile, red = the tile that was hit, green = your picks."""
+    cfg = TOWER_DIFFICULTIES[game["difficulty"]]
+    picks = game["picks"]
+    rows = []
+    for lvl in range(TOWER_LEVELS - 1, -1, -1):
+        row = []
+        for c in range(cfg["cols"]):
+            btn = {"text": "🐍" if c in game["layout"][lvl] else "🥚", "callback_data": "tw_done"}
+            if hit == (lvl, c):
+                btn["style"] = "danger"
+            elif lvl < len(picks) and picks[lvl] == c:
+                btn["style"] = "success"
+            row.append(btn)
+        rows.append(row)
+    return rows
+
 def finish_tower_game(user_id, game, won, hit=None):
     active_tower_games.pop(user_id, None)
     level = len(game["picks"])
     mult = pf_tower_multiplier(game["difficulty"], level) if won else 0.0
     win_amt, _ = fair_settle(user_id, "tower", f"Tower ({game['difficulty'].title()})", "🗼", "Tower", game["bet"], mult, won,
                              game["game_id"], {"levels": level, "picks": list(game["picks"])})
-    head = (
-        f"🗼 *Tower Result* (`{game['game_id']}`)\n\n"
-        f"{tower_final_grid(game, hit)}\n\n"
-        f"⚙️ Mode: *{game['difficulty'].title()}* | 🪜 Level: *{level}/{TOWER_LEVELS}*\n"
-        f"💰 Bet: {format_money(game['bet'], user_id)}\n\n"
+    text_out = (
+        f"💵 Bet: {format_money(game['bet'], user_id)}\n\n"
+        f"🏢 Floors: {level}\n\n"
     )
     if won:
-        body = f"🎉 *Cashed out {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳"
+        text_out += f"🌟 You won {format_money(win_amt, user_id)} ({fmt_mult(mult)})\n"
+        text_out += "🏆 You reached the top!" if level >= TOWER_LEVELS else "🏆 You cashed out"
     else:
-        body = "💀 *Boom! You picked a skull.*"
-    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(game["seeds"])
-    payload = {"kind": "tower", "owner_id": user_id, "bet": game["bet"], "difficulty": game["difficulty"]}
-    edit_message(game["chat_id"], game["message_id"], head + body, reply_markup=create_post_match_keyboard(user_id, payload))
+        text_out += "🌟 Game over\n🏗 The tower collapsed"
+    text_out += f"\n\n💳 Current balance: {format_money(user_balances.get(user_id, 0.0), user_id)}"
+    text_out += fair_footer(game["seeds"], "tower", game["game_id"], difficulty=game["difficulty"])
+    grid = tower_result_rows(game, hit)
+    payload = {"kind": "tower", "owner_id": user_id, "bet": game["bet"], "difficulty": game["difficulty"], "result_grid": grid}
+    post_kb = create_post_match_keyboard(user_id, payload)
+    edit_message(game["chat_id"], game["message_id"], text_out,
+                 reply_markup={"inline_keyboard": grid + post_kb["inline_keyboard"]})
 
 def handle_tower_callback(user_id, chat_id, message_id, data):
     game = active_tower_games.get(user_id)
@@ -3078,6 +3130,8 @@ def handle_fair_callback(chat_id, message_id, user_id, data):
     with get_turn_lock(f"fair_{user_id}"):
         if data.startswith("mn_"):
             handle_mines_callback(user_id, chat_id, message_id, data)
+        elif data == "tw_done":
+            return
         elif data.startswith("tw_"):
             handle_tower_callback(user_id, chat_id, message_id, data)
         elif data == "pf_rotate":
