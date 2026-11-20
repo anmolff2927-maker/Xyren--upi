@@ -438,15 +438,29 @@ def normalize_7up_choice(raw_choice):
         return "7"
     return None
 
-def format_7up_choice_label(canonical_choice):
-    labels = {
-        "up": "UP / HIGH (8–12)",
-        "down": "DOWN / LOW (2–6)",
-        "odd": "ODD",
-        "even": "EVEN",
-        "7": "EXACT 7",
-    }
-    return labels.get(canonical_choice, canonical_choice.upper())
+def format_7up_choice_label(canonical_choice, is_win=True):
+    if canonical_choice == "up":
+        return "up / high (8–12)" if is_win else "up/ high (8–12)"
+    if canonical_choice == "down":
+        return "down / low (2–6)" if is_win else "down/ low (2–6)"
+    if canonical_choice == "odd":
+        return "odd"
+    if canonical_choice == "even":
+        return "even"
+    if canonical_choice == "7":
+        return "7"
+    return str(canonical_choice)
+
+def format_7up_outcome_tag(canonical_choice, total_val):
+    if canonical_choice in ("up", "down"):
+        return "up/high" if total_val >= 8 else ("down/low" if total_val <= 6 else "7")
+    if canonical_choice in ("odd", "even"):
+        return "even" if total_val % 2 == 0 else "odd"
+    if canonical_choice == "7":
+        if total_val == 7:
+            return "7"
+        return "up/high" if total_val >= 8 else "down/low"
+    return "up/high" if total_val >= 8 else ("down/low" if total_val <= 6 else "7")
 
 def evaluate_7up_outcome(canonical_choice, total_val):
     if canonical_choice == "up":
@@ -490,12 +504,12 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
             meta={"choice": canonical_choice, "raw_choice": raw_choice_text or canonical_choice},
             refund_on_cancel=True
         )
-        choice_disp = format_7up_choice_label(canonical_choice)
+        choice_disp_hist = format_7up_choice_label(canonical_choice, is_win=True)
         mult = get_7up_multiplier(canonical_choice)
         send_message(
             chat_id,
             f"🎲🎲 *7Up Rolling!* (`{gid}`)\n"
-            f"🎯 Pick: *{choice_disp}* (`{fmt_mult(mult)}`)\n"
+            f"🎯 Pick: *{choice_disp_hist}* (`{fmt_mult(mult)}`)\n"
             f"💰 Bet: *{format_money(bet_inr, user_id)}*"
         )
 
@@ -507,15 +521,8 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
         time.sleep(0.8)
 
         total_val = d1 + d2
-        parity_str = "Even" if total_val % 2 == 0 else "Odd"
         is_win = evaluate_7up_outcome(canonical_choice, total_val)
-
-        result_text = (
-            f"🎲🎲 *7Up Result* (`{gid}`)\n\n"
-            f"🎯 Dice 1: *{d1}* | Dice 2: *{d2}*\n"
-            f"➕ Combined Total: *{total_val}* ({parity_str})\n"
-            f"📌 Your Pick: *{choice_disp}*\n\n"
-        )
+        outcome_tag = format_7up_outcome_tag(canonical_choice, total_val)
 
         if is_win:
             win_amt = bet_inr * mult
@@ -525,16 +532,19 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
             persist_user(user_id)
             save_config_value("house_balance", HOUSE_BALANCE)
             update_user_stats(user_id, "7up", bet_inr, profit_inr, True)
-            record_user_bet(user_id, f"7Up ({choice_disp})", bet_inr, profit_inr, "WON", game_id=gid)
+            record_user_bet(user_id, f"7Up ({choice_disp_hist})", bet_inr, profit_inr, "WON", game_id=gid)
             mark_game_finished(
                 gid,
                 "completed",
                 extra_meta={"outcome": "WON", "d1": d1, "d2": d2, "total": total_val, "pnl": profit_inr}
             )
             log_win_to_channel(user_id, "🎲", "7Up", win_amt, fmt_mult(mult))
-            result_text += (
-                f"🎉 *You WON {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳\n"
-                f"💰 Balance: *{format_money(user_balances[user_id], user_id)}*"
+            pick_label = format_7up_choice_label(canonical_choice, is_win=True)
+            result_text = (
+                f"🎲 7Up • `{gid}`\n"
+                f"Result: {d1} + {d2} = {total_val} ({outcome_tag})\n"
+                f"Pick: {pick_label}\n"
+                f"🔥 Hit! Won {format_money(win_amt, user_id)} ({fmt_mult(mult)})"
             )
         else:
             profit_inr = -bet_inr
@@ -542,15 +552,18 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
             persist_user(user_id)
             save_config_value("house_balance", HOUSE_BALANCE)
             update_user_stats(user_id, "7up", bet_inr, profit_inr, False)
-            record_user_bet(user_id, f"7Up ({choice_disp})", bet_inr, profit_inr, "LOST", game_id=gid)
+            record_user_bet(user_id, f"7Up ({choice_disp_hist})", bet_inr, profit_inr, "LOST", game_id=gid)
             mark_game_finished(
                 gid,
                 "completed",
                 extra_meta={"outcome": "LOST", "d1": d1, "d2": d2, "total": total_val, "pnl": profit_inr}
             )
-            result_text += (
-                f"😢 *You Lost!* Better luck next time.\n"
-                f"💰 Balance: *{format_money(user_balances[user_id], user_id)}*"
+            target_label = format_7up_choice_label(canonical_choice, is_win=False)
+            result_text = (
+                f"🎲 7Up (`{gid}`)\n"
+                f"Result: {d1} & {d2} → Total: {total_val} ({outcome_tag})\n"
+                f"Target: {target_label}\n"
+                f"📉 Round lost. Shake it off and roll again."
             )
 
         pm_7up_payload = {
@@ -1536,6 +1549,27 @@ def generate_top_wagerers_image(viewer_id=None):
     bio.seek(0)
     return bio
 
+def build_dr_result_message(gid, dice_val, arg, is_win, win_amt=0.0, multiplier=0.0, user_id=None):
+    if arg in ["high", "low", "odd", "even"]:
+        pick_label = arg.upper()
+    else:
+        nums = [int(n.strip()) for n in str(arg).split(",")]
+        pick_label = f"Numbers {nums}"
+
+    if is_win:
+        return (
+            f"🔮 Predict • `{gid}`\n"
+            f"Rolled: {dice_val}\n"
+            f"Pick: {pick_label}\n"
+            f"🔥 Hit! Won {format_money(win_amt, user_id)} ({fmt_mult(multiplier)})"
+        )
+    return (
+        f"🔮 Predict • `{gid}`\n"
+        f"Rolled: {dice_val}\n"
+        f"Pick: {pick_label}\n"
+        f"📉 Round lost. Next roll, new shot."
+    )
+
 def create_post_match_keyboard(user_id, payload):
     token = uuid.uuid4().hex[:10]
     post_match_actions[token] = payload
@@ -1663,7 +1697,6 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
             multiplier = float(dr_num_map.get(len(nums), 1.0))
             win_desc = f"Numbers: {nums}"
 
-        result_text = f"📊 *Dice Prediction Result* (`{gid}`)\n\n🎲 Rolled Number: *{dice_val}*\n🎯 {win_desc}\n\n"
         if is_win:
             win_amt = next_bet * multiplier
             profit_inr = win_amt - next_bet
@@ -1675,7 +1708,7 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
             record_user_bet(user_id, f"Prediction ({win_desc})", next_bet, profit_inr, "WON", game_id=gid)
             mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
             log_win_to_channel(user_id, "🔮", "Predict", win_amt, fmt_mult(multiplier))
-            result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{fmt_mult(multiplier)}`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+            result_text = build_dr_result_message(gid, dice_val, arg, True, win_amt=win_amt, multiplier=multiplier, user_id=user_id)
         else:
             profit_inr = -next_bet
             HOUSE_BALANCE += next_bet
@@ -1684,7 +1717,7 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
             update_user_stats(user_id, "prediction", next_bet, profit_inr, False)
             record_user_bet(user_id, f"Prediction ({win_desc})", next_bet, profit_inr, "LOST", game_id=gid)
             mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
-            result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+            result_text = build_dr_result_message(gid, dice_val, arg, False, user_id=user_id)
 
         pm_payload = {"kind": "dr", "owner_id": user_id, "bet": next_bet, "dr_arg": arg}
         send_message(chat_id, result_text, reply_markup=create_post_match_keyboard(user_id, pm_payload))
@@ -3265,7 +3298,6 @@ def telegram_webhook():
                                 send_message(chat_id, "⚠️ Invalid format! Use `high`, `low`, `odd`, `even` or numbers like `2,4,6`.\nExample: `/dr 50 2,4,6`")
                                 return jsonify({'status': 'ok'}), 200
                                 
-                        result_text = f"📊 *Dice Prediction Result* (`{gid}`)\n\n🎲 Rolled Number: *{dice_val}*\n🎯 {win_desc}\n\n"
                         if is_win:
                             win_amt = bet_inr * multiplier
                             profit_inr = win_amt - bet_inr
@@ -3275,14 +3307,14 @@ def telegram_webhook():
                             record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "WON", game_id=gid)
                             mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
                             log_win_to_channel(user_id, "🔮", "Predict", win_amt, fmt_mult(multiplier))
-                            result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{fmt_mult(multiplier)}`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                            result_text = build_dr_result_message(gid, dice_val, arg, True, win_amt=win_amt, multiplier=multiplier, user_id=user_id)
                         else:
                             profit_inr = -bet_inr
                             HOUSE_BALANCE += bet_inr
                             update_user_stats(user_id, "prediction", bet_inr, profit_inr, False)
                             record_user_bet(user_id, f"Prediction ({win_desc})", bet_inr, profit_inr, "LOST", game_id=gid)
                             mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
-                            result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+                            result_text = build_dr_result_message(gid, dice_val, arg, False, user_id=user_id)
                             
                         pm_dr_payload = {"kind": "dr", "owner_id": user_id, "bet": bet_inr, "dr_arg": arg}
                         send_message(chat_id, result_text, reply_markup=create_post_match_keyboard(user_id, pm_dr_payload))
