@@ -409,7 +409,7 @@ GAME_MULTIPLIERS = {
     "basket": 1.94,
     "bowl": 1.94,
     "pvp": 1.94,
-    "bj": 1.94,
+    "bj": 2.0,
     "dr": 1.92,
     "dr_nums": {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15},
     "7up": {
@@ -1716,6 +1716,7 @@ def create_post_match_keyboard(user_id, payload):
     return {"inline_keyboard": [row1]}
 
 def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier_factor, callback_query_id):
+    global HOUSE_BALANCE
     kind = payload.get("kind")
     last_bet = float(payload.get("bet", 0.0))
     next_bet = last_bet * multiplier_factor
@@ -1744,7 +1745,7 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         )
         return
 
-    if kind == "tower" and payload.get("result_grid"):
+    if payload.get("result_grid"):
         set_inline_keyboard(chat_id, message_id, {"inline_keyboard": payload["result_grid"]})
     else:
         remove_inline_keyboard(chat_id, message_id)
@@ -1773,34 +1774,7 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         run_7up_game(chat_id, user_id, next_bet, choice_7up, raw_choice_text=payload.get("choice_7up"))
 
     elif kind == "bj":
-        global HOUSE_BALANCE
-        gid = generate_game_id()
-        user_balances[user_id] = fresh_bal - next_bet
-        persist_user(user_id)
-        register_game_record(gid, "blackjack", user_id, next_bet, meta={"chat_id": chat_id}, refund_on_cancel=True)
-        p_cards = [draw_card(), draw_card()]
-        d_cards = [draw_card(), draw_card()]
-        p_tot = calculate_hand_total(p_cards)
-        can_double = float(user_balances.get(user_id, 0.0)) >= next_bet
-        table_msg = (
-            f"🃏 *Blackjack Started!* (`{gid}`)\n\n"
-            f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
-            f"🤖 Dealer Shows: `{d_cards[0]}` `[?]`\n"
-            f"💰 Bet: {format_money(next_bet, user_id)}\n\n"
-            f"Choose your move:"
-        )
-        sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
-        msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
-        remember_button_owner(chat_id, msg_id, user_id)
-        active_bj_games[user_id] = {
-            "game_id": gid,
-            "chat_id": chat_id,
-            "message_id": msg_id,
-            "bet": next_bet,
-            "player_cards": p_cards,
-            "dealer_cards": d_cards,
-            "doubled": False
-        }
+        start_bj_game(chat_id, user_id, next_bet)
         answer_callback(callback_query_id, f"Blackjack started ({format_money(next_bet, user_id)})!")
 
     elif kind == "dr":
@@ -2169,7 +2143,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
     p_tot = calculate_hand_total(p_cards)
     d_tot = calculate_hand_total(d_cards)
     bet = bj["bet"]
-    mult = float(GAME_MULTIPLIERS.get("bj", 1.94))
+    mult = float(GAME_MULTIPLIERS.get("bj", 2.0))
 
     header = (
         f"🃏 *Blackjack Result* (`{gid}`)\n\n"
@@ -2204,6 +2178,9 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         body = f"😢 *You Lost!* {reason_txt}\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
 
     mark_game_finished(gid, "completed", extra_meta={"outcome": outcome})
+    if bj.get("seeds"):
+        fair_reveal(bj["seeds"], user_id)
+        body += bj_fair_footer(bj, reveal=True)
     pm_bj_payload = {"kind": "bj", "owner_id": user_id, "bet": bet}
     edit_message(chat_id, message_id, header + body, reply_markup=create_post_match_keyboard(user_id, pm_bj_payload))
     if user_id in active_bj_games:
@@ -2212,7 +2189,7 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
 def play_dealer_and_settle(chat_id, message_id, user_id, bj):
     p_tot = calculate_hand_total(bj["player_cards"])
     while calculate_hand_total(bj["dealer_cards"]) < 17:
-        bj["dealer_cards"].append(draw_card())
+        bj["dealer_cards"].append(bj_draw(bj))
     d_tot = calculate_hand_total(bj["dealer_cards"])
 
     if d_tot > 21 or p_tot > d_tot:
@@ -2693,7 +2670,7 @@ def build_fair_text(uid):
         f"🔒 Next Server Seed (hashed):\n`{pf_sha256(st['server_seed'])}`\n\n"
         f"👤 Client Seed: `{st['client_seed']}`\n"
         f"🔢 Nonce (next bet): `{st['nonce']}`\n\n"
-        "ℹ️ Every Mines, Tower and Limbo bet gets its own server seed. "
+        "ℹ️ Every Mines, Tower, Limbo and Blackjack bet gets its own server seed. "
         "It is revealed automatically when the game ends — just tap *Provably Fair* on the result message.\n"
         "✏️ Set your own client seed: `/setseed yourtext`"
     )
@@ -2706,7 +2683,7 @@ def clean_client_seed(raw):
     return cleaned or None
 
 def has_open_fair_game(uid):
-    return uid in active_mines_games or uid in active_tower_games
+    return uid in active_mines_games or uid in active_tower_games or uid in active_bj_games
 
 
 # ---------------- shared bet helpers ----------------
@@ -2751,6 +2728,21 @@ def fair_settle(user_id, game_key, game_label, emoji, title, bet, mult, won, gid
     return win_amt, profit
 
 
+def signed_money(amount_in_inr, user_id):
+    if amount_in_inr < 0:
+        return "-" + format_money(-amount_in_inr, user_id)
+    return format_money(amount_in_inr, user_id)
+
+def fair_result_text(title, bet, mult, win_amt, user_id):
+    return (
+        f"{title}\n\n"
+        f"Profit: *{signed_money(win_amt - bet, user_id)}*\n"
+        f"Multiplier: *{fmt_mult(mult)}*\n"
+        f"Bet: {format_money(bet, user_id)}\n"
+        f"Payout: *{format_money(win_amt, user_id)}*"
+    )
+
+
 # ---------------- LIMBO ----------------
 def run_limbo_game(chat_id, user_id, bet_inr, target, reply_to_message_id=None):
     if not fair_validate_bet(chat_id, user_id, bet_inr, "/limbo 50 2"):
@@ -2767,18 +2759,13 @@ def run_limbo_game(chat_id, user_id, bet_inr, target, reply_to_message_id=None):
     win_amt, _ = fair_settle(user_id, "limbo", f"Limbo ({target:.2f}x)", "🚀", "Limbo", bet_inr, target, won, gid, {"result": result})
 
     chance = min(100.0, FAIR_RTP / target * 100)
+    fair_reveal(seeds, user_id)
     text_out = (
         f"🚀 *Limbo* (`{gid}`)\n\n"
         f"🎯 Target: *{target:.2f}x* (win chance {chance:.2f}%)\n"
-        f"📈 Result: *{result:.2f}x*\n"
-        f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
-    )
-    if won:
-        text_out += f"🎉 *You WON {format_money(win_amt, user_id)}*! 🥳"
-    else:
-        text_out += "😢 *You Lost!*"
-    fair_reveal(seeds, user_id)
-    text_out += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(seeds, "limbo", gid, reveal=True, target=f"{target:.2f}", result=f"{result:.2f}")
+        f"📈 Result: *{result:.2f}x* {'✅' if won else '❌'}\n"
+        f"💰 Bet: {format_money(bet_inr, user_id)}"
+    ) + fair_footer(seeds, "limbo", gid, reveal=True, target=f"{target:.2f}", result=f"{result:.2f}")
     payload = {"kind": "limbo", "owner_id": user_id, "bet": bet_inr, "target": target}
     sent = send_message(chat_id, text_out, reply_markup=create_post_match_keyboard(user_id, payload), reply_to_message_id=reply_to_message_id)
     remember_button_owner(chat_id, sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None, user_id)
@@ -2851,29 +2838,38 @@ def start_mines_game(chat_id, user_id, bet_inr, mines, reply_to_message_id=None)
     game["message_id"] = msg_id
     remember_button_owner(chat_id, msg_id, user_id)
 
+def mines_result_rows(game, hit_idx=None):
+    """Final board as buttons: 💣 = mine, 💎 = safe, red = the mine you hit, green = your picks."""
+    rows = []
+    for r in range(5):
+        row = []
+        for c in range(5):
+            idx = r * 5 + c
+            btn = {"text": "💣" if idx in game["layout"] else "💎", "callback_data": "mn_done"}
+            if idx == hit_idx:
+                btn["style"] = "danger"
+            elif idx in game["revealed"]:
+                btn["style"] = "success"
+            row.append(btn)
+        rows.append(row)
+    return rows
+
 def finish_mines_game(user_id, game, won, hit_idx=None):
     active_mines_games.pop(user_id, None)
     picks = len(game["revealed"])
     mult = pf_mines_multiplier(game["mines"], picks) if won else 0.0
     win_amt, _ = fair_settle(user_id, "mines", f"Mines ({game['mines']}💣)", "💣", "Mines", game["bet"], mult, won,
                              game["game_id"], {"picks": picks, "revealed": list(game["revealed"])})
-    head = (
-        f"💣 *Mines Result* (`{game['game_id']}`)\n\n"
-        f"{mines_final_grid(game, hit_idx)}\n\n"
-        f"💣 Mines: *{game['mines']}* | 💎 Found: *{picks}*\n"
-        f"💰 Bet: {format_money(game['bet'], user_id)}\n\n"
-    )
-    if won:
-        body = f"🎉 *Cashed out {format_money(win_amt, user_id)}* (`{fmt_mult(mult)}`)! 🥳"
-    else:
-        body = "💥 *Boom! You hit a mine.*"
     fair_reveal(game["seeds"], user_id)
-    body += f"\n💰 Balance: {format_money(user_balances.get(user_id, 0.0), user_id)}" + fair_footer(
+    text_out = fair_result_text("*Mines* 💣", game["bet"], mult, win_amt, user_id) + fair_footer(
         game["seeds"], "mines", game["game_id"], reveal=True, mines=game["mines"],
         picks=",".join(str(i) for i in game["revealed"]) or None,
         hit=hit_idx)
-    payload = {"kind": "mines", "owner_id": user_id, "bet": game["bet"], "mines": game["mines"]}
-    edit_message(game["chat_id"], game["message_id"], head + body, reply_markup=create_post_match_keyboard(user_id, payload))
+    grid = mines_result_rows(game, hit_idx)
+    payload = {"kind": "mines", "owner_id": user_id, "bet": game["bet"], "mines": game["mines"], "result_grid": grid}
+    post_kb = create_post_match_keyboard(user_id, payload)
+    edit_message(game["chat_id"], game["message_id"], text_out,
+                 reply_markup={"inline_keyboard": grid + post_kb["inline_keyboard"]})
 
 def handle_mines_callback(user_id, chat_id, message_id, data):
     game = active_mines_games.get(user_id)
@@ -3001,17 +2997,8 @@ def finish_tower_game(user_id, game, won, hit=None):
     mult = pf_tower_multiplier(game["difficulty"], level) if won else 0.0
     win_amt, _ = fair_settle(user_id, "tower", f"Tower ({game['difficulty'].title()})", "🗼", "Tower", game["bet"], mult, won,
                              game["game_id"], {"levels": level, "picks": list(game["picks"])})
-    text_out = (
-        f"💵 Bet: {format_money(game['bet'], user_id)}\n\n"
-        f"🏢 Floors: {level}\n\n"
-    )
-    if won:
-        text_out += f"🌟 You won {format_money(win_amt, user_id)} ({fmt_mult(mult)})\n"
-        text_out += "🏆 You reached the top!" if level >= TOWER_LEVELS else "🏆 You cashed out"
-    else:
-        text_out += "🌟 Game over\n🏗 The tower collapsed"
-    text_out += f"\n\n💳 Current balance: {format_money(user_balances.get(user_id, 0.0), user_id)}"
     fair_reveal(game["seeds"], user_id)
+    text_out = fair_result_text("*Tower* 🗼", game["bet"], mult, win_amt, user_id)
     text_out += fair_footer(game["seeds"], "tower", game["game_id"], reveal=True, difficulty=game["difficulty"],
                             picks=",".join(str(c) for c in game["picks"]) or None,
                             hit=hit[1] if hit else None)
@@ -3116,7 +3103,7 @@ def handle_fair_command(chat_id, chat_type, user_id, text, message):
             send_message(chat_id, "⚠️ Usage: `/setseed yourtext` (letters, numbers, - only, max 32)")
             return
         if has_open_fair_game(user_id):
-            send_message(chat_id, "⚠️ Finish your Mines / Tower game before changing seeds.")
+            send_message(chat_id, "⚠️ Finish your Mines / Tower / Blackjack game before changing seeds.")
             return
         old_seed, old_hash = fair_rotate(user_id, new_seed)
         send_message(chat_id, f"✅ Client seed set to `{new_seed}`.\n\n🔓 Previous server seed revealed:\n`{old_seed}`\n\n" + build_fair_text(user_id))
@@ -3158,15 +3145,15 @@ def handle_fair_command(chat_id, chat_type, user_id, text, message):
 
 def handle_fair_callback(chat_id, message_id, user_id, data):
     with get_turn_lock(f"fair_{user_id}"):
+        if data in ("tw_done", "mn_done"):
+            return
         if data.startswith("mn_"):
             handle_mines_callback(user_id, chat_id, message_id, data)
-        elif data == "tw_done":
-            return
         elif data.startswith("tw_"):
             handle_tower_callback(user_id, chat_id, message_id, data)
         elif data == "pf_rotate":
             if has_open_fair_game(user_id):
-                send_message(chat_id, "⚠️ Finish your Mines / Tower game before changing seeds.")
+                send_message(chat_id, "⚠️ Finish your Mines / Tower / Blackjack game before changing seeds.")
                 return
             old_seed, _ = fair_rotate(user_id)
             edit_message(chat_id, message_id, f"🔓 *Previous server seed revealed:*\n`{old_seed}`\n\n" + build_fair_text(user_id), reply_markup=fair_keyboard())
@@ -3179,6 +3166,68 @@ def restart_fair_game(chat_id, user_id, payload, next_bet):
         start_mines_game(chat_id, user_id, next_bet, int(payload.get("mines", MINES_DEFAULT)))
     elif kind == "tower":
         start_tower_game(chat_id, user_id, next_bet, payload.get("difficulty", "easy"))
+# ---------------- BLACKJACK (provably fair deck) ----------------
+def pf_bj_cards(seeds, count):
+    """Card i of the hand = float i of the bet: 0..51 -> rank (i % 13) + suit (i // 13).
+    Deal order: you, you, dealer, dealer, then your hits, then the dealer's draws."""
+    floats = pf_floats(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], count)
+    cards = []
+    for f in floats:
+        idx = int(_pf_math.floor(f * 52))
+        cards.append(f"{DECK_RANKS[idx % 13]}{DECK_SUITS[idx // 13]}")
+    return cards
+
+def bj_draw(bj):
+    seeds = bj.get("seeds")
+    if not seeds:
+        return draw_card()
+    pos = bj.get("drawn", 0)
+    bj["drawn"] = pos + 1
+    return pf_bj_cards(seeds, pos + 1)[pos]
+
+def bj_fair_footer(bj, reveal=False):
+    seeds = bj.get("seeds")
+    if not seeds:
+        return ""
+    extra = {}
+    if reveal:
+        extra = {"pc": len(bj["player_cards"]), "dc": len(bj["dealer_cards"])}
+    return fair_footer(seeds, "bj", bj.get("game_id"), reveal=reveal, **extra)
+
+def start_bj_game(chat_id, user_id, bet_inr):
+    gid = generate_game_id()
+    user_balances[user_id] = float(user_balances.get(user_id, 0.0)) - bet_inr
+    persist_user(user_id)
+    seeds = fair_take_seeds(user_id)
+    register_game_record(gid, "blackjack", user_id, bet_inr, meta=dict(fair_meta(seeds), chat_id=chat_id), refund_on_cancel=True)
+    bj = {
+        "game_id": gid,
+        "chat_id": chat_id,
+        "message_id": None,
+        "bet": bet_inr,
+        "seeds": seeds,
+        "drawn": 0,
+        "player_cards": [],
+        "dealer_cards": [],
+        "doubled": False,
+    }
+    bj["player_cards"] = [bj_draw(bj), bj_draw(bj)]
+    bj["dealer_cards"] = [bj_draw(bj), bj_draw(bj)]
+    p_tot = calculate_hand_total(bj["player_cards"])
+    can_double = float(user_balances.get(user_id, 0.0)) >= bet_inr
+    table_msg = (
+        f"🃏 *Blackjack Started!* (`{gid}`)\n\n"
+        f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
+        f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
+        f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
+        f"Choose your move:" + bj_fair_footer(bj)
+    )
+    active_bj_games[user_id] = bj
+    sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
+    msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+    bj["message_id"] = msg_id
+    remember_button_owner(chat_id, msg_id, user_id)
+
 # ===================== END PROVABLY FAIR GAMES =====================
 
 
@@ -4065,34 +4114,7 @@ def telegram_webhook():
                             f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, user_id)}*\n🎯 Required Bet: *{format_money(bet_inr, user_id)}*"
                         )
                     else:
-                        gid = generate_game_id()
-                        user_balances[user_id] = current_bal - bet_inr
-                        register_game_record(gid, "blackjack", user_id, bet_inr, meta={"chat_id": chat_id}, refund_on_cancel=True)
-                        p_cards = [draw_card(), draw_card()]
-                        d_cards = [draw_card(), draw_card()]
-                        p_tot = calculate_hand_total(p_cards)
-
-                        can_double = user_balances.get(user_id, 0.0) >= bet_inr
-                        table_msg = (
-                            f"🃏 *Blackjack Started!* (`{gid}`)\n\n"
-                            f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
-                            f"🤖 Dealer Shows: `{d_cards[0]}` `[?]`\n"
-                            f"💰 Bet: {format_money(bet_inr, user_id)}\n\n"
-                            f"Choose your move:"
-                        )
-                        sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
-                        msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
-                        remember_button_owner(chat_id, msg_id, user_id)
-
-                        active_bj_games[user_id] = {
-                            "game_id": gid,
-                            "chat_id": chat_id,
-                            "message_id": msg_id,
-                            "bet": bet_inr,
-                            "player_cards": p_cards,
-                            "dealer_cards": d_cards,
-                            "doubled": False
-                        }
+                        start_bj_game(chat_id, user_id, bet_inr)
                     return jsonify({'status': 'ok'}), 200
                     
                 elif text in ['/balance', '/bal']:
@@ -4812,7 +4834,7 @@ def telegram_webhook():
                 target_msg = bj.get("message_id") or message_id
 
                 if callback_data == "bj_hit":
-                    bj["player_cards"].append(draw_card())
+                    bj["player_cards"].append(bj_draw(bj))
                     p_tot = calculate_hand_total(bj["player_cards"])
                     if p_tot > 21:
                         finish_bj_game(target_chat, target_msg, user_id, bj, "bust")
@@ -4824,7 +4846,7 @@ def telegram_webhook():
                             f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
                             f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
                             f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
-                            f"Choose your next move:"
+                            f"Choose your next move:" + bj_fair_footer(bj)
                         )
                         edit_message(target_chat, target_msg, msg, reply_markup=bj_action_keyboard(can_double=False))
 
@@ -4840,7 +4862,7 @@ def telegram_webhook():
                             f"👤 Your Hand: {format_cards(bj['player_cards'])} (*{p_tot}*)\n"
                             f"🤖 Dealer Shows: `{bj['dealer_cards'][0]}` `[?]`\n"
                             f"💰 Bet: {format_money(bj['bet'], user_id)}\n\n"
-                            f"❌ Insufficient balance to Double! Choose Hit or Stand:"
+                            f"❌ Insufficient balance to Double! Choose Hit or Stand:" + bj_fair_footer(bj)
                         )
                         edit_message(target_chat, target_msg, msg, reply_markup=bj_action_keyboard(can_double=False))
                         return jsonify({'status': 'ok'}), 200
@@ -4848,7 +4870,7 @@ def telegram_webhook():
                     user_balances[user_id] = user_balances.get(user_id, 0.0) - extra_bet
                     bj["bet"] += extra_bet
                     bj["doubled"] = True
-                    bj["player_cards"].append(draw_card())
+                    bj["player_cards"].append(bj_draw(bj))
                     p_tot = calculate_hand_total(bj["player_cards"])
 
                     if p_tot > 21:
