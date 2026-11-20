@@ -560,10 +560,15 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
             log_win_to_channel(user_id, "🎲", "7Up", win_amt, fmt_mult(mult))
             pick_label = format_7up_choice_label(canonical_choice, is_win=True)
             result_text = (
-                f"🎲 7Up • `{gid}`\n"
-                f"Result: {d1} + {d2} = {total_val} ({outcome_tag})\n"
-                f"Pick: {pick_label}\n"
-                f"🔥 Hit! Won {format_money(win_amt, user_id)} ({fmt_mult(mult)})"
+                f"📊 7UP GAME REPORT\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"🔑 Round ID: {gid}\n"
+                f"🎲 Dice Result: {d1} + {d2} = {total_val}\n"
+                f"🎯 Selected: {pick_label}\n"
+                f"🔥 Outcome: Win\n"
+                f"💰 Payout: {format_money(win_amt, user_id)}\n"
+                f"⚡ Multiplier: {fmt_mult(mult)}\n"
+                f"━━━━━━━━━━━━━━━━"
             )
         else:
             profit_inr = -bet_inr
@@ -577,12 +582,17 @@ def run_7up_game(chat_id, user_id, bet_inr, canonical_choice, raw_choice_text=No
                 "completed",
                 extra_meta={"outcome": "LOST", "d1": d1, "d2": d2, "total": total_val, "pnl": profit_inr}
             )
-            target_label = format_7up_choice_label(canonical_choice, is_win=False)
+            pick_label = format_7up_choice_label(canonical_choice, is_win=True)
             result_text = (
-                f"🎲 7Up (`{gid}`)\n"
-                f"Result: {d1} & {d2} → Total: {total_val} ({outcome_tag})\n"
-                f"Target: {target_label}\n"
-                f"📉 Round lost. Shake it off and roll again."
+                f"📊 7UP GAME REPORT\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"🔑 Round ID: {gid}\n"
+                f"🎲 Dice Result: {d1} + {d2} = {total_val}\n"
+                f"🎯 Selected: {pick_label}\n"
+                f"🔥 Outcome: loss\n"
+                f"💰 Payout: {format_money(0.0, user_id)}\n"
+                f"⚡ Multiplier: {fmt_mult(mult)}\n"
+                f"━━━━━━━━━━━━━━━━"
             )
 
         pm_7up_payload = {
@@ -1579,20 +1589,28 @@ def build_dr_result_message(gid, dice_val, arg, is_win, win_amt=0.0, multiplier=
         pick_label = arg.upper()
     else:
         nums = [int(n.strip()) for n in str(arg).split(",")]
-        pick_label = f"Numbers {nums}"
+        pick_label = " • ".join(str(n) for n in nums)
 
     if is_win:
         return (
-            f"🔮 Predict • `{gid}`\n"
-            f"Rolled: {dice_val}\n"
-            f"Pick: {pick_label}\n"
-            f"🔥 Hit! Won {format_money(win_amt, user_id)} ({fmt_mult(multiplier)})"
+            f"📊 PREDICTION REPORT\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🔑 Round ID: {gid}\n"
+            f"🎲 Actual Result: {dice_val}\n"
+            f"🎯 Selected Range: {pick_label}\n"
+            f"🔥 Final Status: Win\n"
+            f"💰 Payout: {format_money(win_amt, user_id)} ({fmt_mult(multiplier)})\n"
+            f"━━━━━━━━━━━━━━━━"
         )
     return (
-        f"🔮 Predict • `{gid}`\n"
-        f"Rolled: {dice_val}\n"
-        f"Pick: {pick_label}\n"
-        f"📉 Round lost. Next roll, new shot."
+        f"📊 PREDICTION REPORT\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🔑 Round ID: {gid}\n"
+        f"🎲 Actual Roll: {dice_val}\n"
+        f"🎯 Selected Range: {pick_label}\n"
+        f"📉 Final Status: Lost\n"
+        f"💰 Payout: {format_money(0.0, user_id)}\n"
+        f"━━━━━━━━━━━━━━━━"
     )
 
 def create_post_match_keyboard(user_id, payload):
