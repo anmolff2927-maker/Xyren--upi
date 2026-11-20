@@ -17,6 +17,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
 BOT_USERNAME = "@Xyren_upibot"
 WINS_CHANNEL_ID = os.environ.get("WINS_CHANNEL_ID", "3555754688")
+WITHDRAW_LOG_CHANNEL_ID = os.environ.get("WITHDRAW_LOG_CHANNEL_ID", "3975966539")
 WINS_CHANNEL_USERNAME = "xyren_wins"
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -984,6 +985,23 @@ def normalize_channel_id(raw_id):
     if s.isdigit():
         return int(f"-100{s}")
     return s
+
+def mask_user_id_for_log(user_id):
+    value = str(user_id)
+    if len(value) <= 4:
+        return "*" * len(value)
+    return "*" * (len(value) - 4) + value[-4:]
+
+def mask_upi_id_for_log(upi_id):
+    value = str(upi_id or "").strip()
+    local, separator, provider = value.partition("@")
+    if separator:
+        if len(local) <= 2:
+            masked_local = (local[:1] + "*") if local else "**"
+        else:
+            masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
+        return f"{masked_local}@{provider}"
+    return mask_user_id_for_log(value)
 
 def format_user_mention(user_id):
     uname = user_usernames.get(user_id)
@@ -5218,6 +5236,12 @@ def telegram_webhook():
                         f"💰 Amount: *{amt_str}*\n"
                         f"🏦 UPI ID: `{upi_id}`"
                     )
+                    channel_log_msg = (
+                        "🚨 *NEW WITHDRAWAL REQUEST*\n\n"
+                        f"👤 User ID: `{mask_user_id_for_log(user_id)}`\n"
+                        f"💰 Amount: *{amt_str}*\n"
+                        f"🏦 UPI ID: `{mask_upi_id_for_log(upi_id)}`"
+                    )
                     admin_keyboard = {
                         "inline_keyboard": [
                             [
@@ -5227,6 +5251,9 @@ def telegram_webhook():
                         ]
                     }
                     send_message(ADMIN_USER_ID, admin_msg, reply_markup=admin_keyboard)
+                    withdraw_log_channel = normalize_channel_id(WITHDRAW_LOG_CHANNEL_ID)
+                    if withdraw_log_channel:
+                        send_message(withdraw_log_channel, channel_log_msg)
                     del withdrawal_states[user_id]
                 
             elif callback_data.startswith("admin_wd_paid_") or callback_data.startswith("admin_wd_reject_"):
