@@ -877,6 +877,8 @@ def load_all_from_db():
                     WITHDRAW_ENABLED = bool(v)
                 elif k == "dm_games_enabled":
                     DM_GAMES_ENABLED = bool(v)
+                elif k == "helper_bots":
+                    HELPER_BOTS[:] = [x for x in (v or []) if isinstance(x, dict) and x.get("token")]
                 elif k == "group_link":
                     GROUP_LINK = v if v else None
                 elif k == "game_multipliers" and isinstance(v, dict):
@@ -1240,6 +1242,10 @@ def roll_text(vals):
     return f"{'+'.join(map(str, vals))} = {total}"
 
 def resolve_pvp_round_and_match(chat_id, match_id, pvm):
+    with helper_voice(chat_id):
+        return _resolve_pvp_round_and_match(chat_id, match_id, pvm)
+
+def _resolve_pvp_round_and_match(chat_id, match_id, pvm):
     global HOUSE_BALANCE
     gid = pvm.get("game_id") or match_id
     emoji = pvm["emoji"]
@@ -1408,12 +1414,159 @@ def parse_user_amount(text_val, user_id):
     except:
         return None
 
+
+# =====================================================================
+# 🤖 HELPER BOTS — up to 3 helper bots throw every emoji in groups and
+# send the round / final round messages, so the main bot has less load.
+# Admin manages them with /helper (token is saved in the DB, no file edits).
+# Main bot throws only as an emergency backup (no helper could throw)
+# and in player DMs (Telegram does not let helpers post in someone's DM).
+# =====================================================================
+import hashlib as _hb_hashlib
+import hmac as _hb_hmac
+
+MAX_HELPERS = 3
+HELPER_BOTS = []            # [{"id", "username", "token", "enabled", "hook"}]
+HELPER_THROW_WAIT = 4       # seconds to wait for a rate-limited helper before backup
+_helper_lock = threading.Lock()
+_helper_rr = [0]
+_helper_cooldown = {}       # helper_id -> unix time it can be used again (Telegram 429)
+_helper_chat_block = {}     # (helper_id, chat_id) -> unix time (helper not in that chat)
+_helper_backup_note = {}    # chat_id -> last time admin was told main bot threw
+_tg_ctx = threading.local() # per-request: which bot answers / which helper speaks
+
+def _api_base():
+    return getattr(_tg_ctx, "api", None) or TELEGRAM_API_URL
+
+def tg_url(method):
+    return f"{_api_base()}/{method}"
+
+def helper_api(h):
+    return f"https://api.telegram.org/bot{h['token']}"
+
+def helper_ids():
+    return {h.get("id") for h in HELPER_BOTS}
+
+def save_helpers():
+    save_config_value("helper_bots", HELPER_BOTS)
+
+def helper_hook_secret(token):
+    return _hb_hashlib.sha256(f"xyren-helper:{token}".encode()).hexdigest()
+
+def _md_safe(t):
+    return str(t).replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
+
+def _helpers_for_chat(chat_id):
+    """Enabled helpers usable in this chat, in round-robin order (spreads the load)."""
+    now = time.time()
+    with _helper_lock:
+        live = [h for h in HELPER_BOTS if h.get("enabled") and _helper_chat_block.get((h.get("id"), chat_id), 0) <= now]
+        if not live:
+            return []
+        start = _helper_rr[0] % len(live)
+        _helper_rr[0] += 1
+    return live[start:] + live[:start]
+
+_HELPER_NOT_IN_CHAT = ("chat not found", "not a member", "kicked", "forbidden", "rights", "chat_send", "initiate", "blocked", "restricted")
+
+def _helper_post(h, method, payload, timeout=5):
+    try:
+        data = requests.post(f"{helper_api(h)}/{method}", json=payload, timeout=timeout).json()
+    except Exception as e:
+        print(f"Helper @{h.get('username')} {method} error: {e}")
+        return None
+    if not data.get("ok"):
+        code = data.get("error_code")
+        desc = str(data.get("description", "")).lower()
+        if code == 429:
+            wait = (data.get("parameters") or {}).get("retry_after", 3)
+            _helper_cooldown[h.get("id")] = time.time() + float(wait)
+        elif code == 401:
+            h["enabled"] = False
+            save_helpers()
+            try:
+                requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": ADMIN_USER_ID, "text": f"⚠️ Helper @{h.get('username')} token stopped working (revoked?). It is now OFF. Re-add it with /helper add <token>."}, timeout=5)
+            except Exception:
+                pass
+        elif code in (400, 403) and any(k in desc for k in _HELPER_NOT_IN_CHAT):
+            _helper_chat_block[(h.get("id"), payload.get("chat_id"))] = time.time() + 600
+        print(f"Helper @{h.get('username')} {method} failed: {data.get('description')}")
+    return data
+
+def _main_throw(payload):
+    try:
+        return requests.post(f"{TELEGRAM_API_URL}/sendDice", json=payload, timeout=5).json()
+    except Exception as e:
+        print(f"Error sending game: {e}")
+        return None
+
+def _note_backup_throw(chat_id, why):
+    now = time.time()
+    if now - _helper_backup_note.get(chat_id, 0) < 600:
+        return
+    _helper_backup_note[chat_id] = now
+    try:
+        requests.post(
+            f"{TELEGRAM_API_URL}/sendMessage",
+            json={"chat_id": ADMIN_USER_ID, "text": f"⚠️ Main bot threw an emoji as backup in chat {chat_id} ({why}). Check /helper — add the helpers to that group or turn them on."},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+class helper_voice:
+    """Inside this block, messages to `chat_id` go out from a helper bot.
+    If the helper can't send, the main bot sends it instead (no message is lost)."""
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+    def __enter__(self):
+        self.prev = (getattr(_tg_ctx, "voice", None), getattr(_tg_ctx, "voice_chat", None))
+        pick = None
+        if isinstance(self.chat_id, int) and self.chat_id < 0:
+            now = time.time()
+            for h in _helpers_for_chat(self.chat_id):
+                if _helper_cooldown.get(h.get("id"), 0) <= now:
+                    pick = h
+                    break
+        _tg_ctx.voice = pick
+        _tg_ctx.voice_chat = self.chat_id if pick else None
+        return self
+    def __exit__(self, *exc):
+        _tg_ctx.voice, _tg_ctx.voice_chat = self.prev
+        return False
+
+_EDIT_WRONG_BOT = ("can't be edited", "message to edit not found", "message_id_invalid", "message can't be")
+
+def _tg_edit(method, payload, timeout=5):
+    """Edit a message. If this bot didn't send it, try the other bots (main + helpers)."""
+    bases = [_api_base(), TELEGRAM_API_URL] + [helper_api(h) for h in HELPER_BOTS]
+    seen = set()
+    data = None
+    for base in bases:
+        if base in seen:
+            continue
+        seen.add(base)
+        body = dict(payload)
+        try:
+            data = requests.post(f"{base}/{method}", json=body, timeout=timeout).json()
+            if not data.get("ok") and "parse" in str(data.get("description", "")).lower() and "parse_mode" in body:
+                body.pop("parse_mode", None)
+                data = requests.post(f"{base}/{method}", json=body, timeout=timeout).json()
+        except Exception as e:
+            print(f"Error {method}: {e}")
+            return None
+        if data.get("ok"):
+            return data
+        desc = str(data.get("description", "")).lower()
+        if not any(k in desc for k in _EDIT_WRONG_BOT):
+            return data
+    return data
+
 def _has_fair_link(text):
     url = os.environ.get("VERIFY_URL")
     return bool(url and text and url.rstrip("/") in text)
 
 def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
-    url = f"{TELEGRAM_API_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -1422,19 +1575,37 @@ def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
         payload["allow_sending_without_reply"] = True
     if _has_fair_link(text):
         payload["link_preview_options"] = {"is_disabled": True}
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        data = res.json()
-        if not data.get("ok") and "parse" in str(data.get("description", "")).lower():
-            payload.pop("parse_mode", None)
-            data = requests.post(url, json=payload, timeout=5).json()
-        return data
-    except Exception as e:
-        print(f"Error sending message: {e}")
-        return None
+
+    # Round / final round messages: sent by a helper bot.
+    voice = getattr(_tg_ctx, "voice", None)
+    if voice and voice.get("enabled") and getattr(_tg_ctx, "voice_chat", None) == chat_id and (not reply_markup or voice.get("hook")):
+        body = dict(payload)
+        data = _helper_post(voice, "sendMessage", body)
+        if data and not data.get("ok") and "parse" in str(data.get("description", "")).lower():
+            body.pop("parse_mode", None)
+            data = _helper_post(voice, "sendMessage", body)
+        if data and data.get("ok"):
+            return data
+
+    bases = [_api_base()]
+    if bases[0] != TELEGRAM_API_URL:
+        bases.append(TELEGRAM_API_URL)
+    data = None
+    for base in bases:
+        body = dict(payload)
+        try:
+            data = requests.post(f"{base}/sendMessage", json=body, timeout=5).json()
+            if not data.get("ok") and "parse" in str(data.get("description", "")).lower():
+                body.pop("parse_mode", None)
+                data = requests.post(f"{base}/sendMessage", json=body, timeout=5).json()
+            if data.get("ok"):
+                return data
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            data = None
+    return data
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
-    url = f"{TELEGRAM_API_URL}/editMessageText"
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1447,19 +1618,13 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
         payload["reply_markup"] = {"inline_keyboard": []}
     if _has_fair_link(text):
         payload["link_preview_options"] = {"is_disabled": True}
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        data = res.json()
-        if not data.get("ok") and "parse" in str(data.get("description", "")).lower():
-            payload.pop("parse_mode", None)
-            data = requests.post(url, json=payload, timeout=5).json()
-        return data
-    except Exception as e:
-        print(f"Error editing message: {e}")
-        return None
+    data = _tg_edit("editMessageText", payload, timeout=5)
+    if data is None:
+        print("Error editing message")
+    return data
 
 def answer_callback(callback_query_id, text=""):
-    url = f"{TELEGRAM_API_URL}/answerCallbackQuery"
+    url = tg_url("answerCallbackQuery")
     payload = {"callback_query_id": callback_query_id, "text": text}
     try:
         requests.post(url, json=payload, timeout=3)
@@ -1467,24 +1632,16 @@ def answer_callback(callback_query_id, text=""):
         print(f"Error answering callback: {e}")
 
 def remove_inline_keyboard(chat_id, message_id):
-    url = f"{TELEGRAM_API_URL}/editMessageReplyMarkup"
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
         "reply_markup": {"inline_keyboard": []}
     }
-    try:
-        requests.post(url, json=payload, timeout=3)
-    except Exception as e:
-        print(f"Error removing keyboard: {e}")
+    _tg_edit("editMessageReplyMarkup", payload, timeout=3)
 
 def set_inline_keyboard(chat_id, message_id, reply_markup):
-    url = f"{TELEGRAM_API_URL}/editMessageReplyMarkup"
     payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
-    try:
-        requests.post(url, json=payload, timeout=3)
-    except Exception as e:
-        print(f"Error setting keyboard: {e}")
+    _tg_edit("editMessageReplyMarkup", payload, timeout=3)
 
 def send_photo(chat_id, photo_bio, caption=""):
     url = f"{TELEGRAM_API_URL}/sendPhoto"
@@ -2200,17 +2357,41 @@ def play_dealer_and_settle(chat_id, message_id, user_id, bj):
         finish_bj_game(chat_id, message_id, user_id, bj, "push")
 
 def send_animated_game(chat_id, emoji, reply_to_message_id=None):
-    url = f"{TELEGRAM_API_URL}/sendDice"
+    """Every emoji throw in a group is done by a helper bot (round-robin).
+    Main bot throws only in a player's DM, or as emergency backup when no helper could."""
     payload = {"chat_id": chat_id, "emoji": emoji}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        return res.json()
-    except Exception as e:
-        print(f"Error sending game: {e}")
-        return None
+
+    # Player DM: helpers can't post there, the main bot throws.
+    if isinstance(chat_id, int) and chat_id > 0:
+        return _main_throw(payload)
+
+    deadline = time.time() + HELPER_THROW_WAIT
+    while True:
+        order = _helpers_for_chat(chat_id)
+        if not order:
+            break
+        now = time.time()
+        for h in order:
+            if _helper_cooldown.get(h.get("id"), 0) > now:
+                continue
+            data = _helper_post(h, "sendDice", payload)
+            if data and data.get("ok") and (data.get("result") or {}).get("dice"):
+                return data
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        soonest = min(max(0.3, _helper_cooldown.get(h.get("id"), 0) - time.time()) for h in order)
+        if soonest > left:
+            break
+        time.sleep(soonest)
+
+    # Emergency backup: no helper could throw here.
+    why = "no helper is ON" if not any(h.get("enabled") for h in HELPER_BOTS) else "helpers failed or are not in this group"
+    _note_backup_throw(chat_id, why)
+    return _main_throw(payload)
 
 def roll_bot_series(chat_id, emoji, rolls_count, reply_to_message_id=None):
     vals = []
@@ -2289,6 +2470,10 @@ def build_pvb_final_text(user_id, emoji, u_vals, b_vals, user_won, game, gid, wi
     )
 
 def resolve_round_and_match(chat_id, user_id, game):
+    with helper_voice(chat_id):
+        return _resolve_round_and_match(chat_id, user_id, game)
+
+def _resolve_round_and_match(chat_id, user_id, game):
     global HOUSE_BALANCE
     gid = game.get("game_id")
     emoji = game["emoji"]
@@ -3249,6 +3434,9 @@ def telegram_webhook():
             chat_type = message['chat'].get('type')
             user_id = message['from'].get('id')
 
+            if message['from'].get('is_bot') and user_id in helper_ids():
+                return jsonify({'status': 'ok'}), 200
+
             if 'reply_to_message' in message and message['reply_to_message'].get('from'):
                 register_user_identity(message['reply_to_message']['from'])
             
@@ -3564,6 +3752,12 @@ def telegram_webhook():
 
             if 'text' in message:
                 text = message['text'].strip()
+
+                if re.match(rf"^/helpers?(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        return jsonify({'status': 'ok'}), 200
+                    handle_helper_command(chat_id, chat_type, text, message)
+                    return jsonify({'status': 'ok'}), 200
 
                 if re.match(rf"^/offgame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
                     if user_id not in admin_list:
@@ -4207,6 +4401,7 @@ def telegram_webhook():
                             f"💳 *Deposits:* {'🟢 Enabled' if DEPOSIT_ENABLED else '🔴 Disabled'}\n"
                             f"💸 *Withdrawals:* {'🟢 Enabled' if WITHDRAW_ENABLED else '🔴 Disabled'}\n"
                             f"🎮 *DM Games:* {'🟢 ON' if DM_GAMES_ENABLED else '🔴 OFF'}\n"
+                            f"🤖 *Helper Bots:* {sum(1 for h in HELPER_BOTS if h.get('enabled'))}/{len(HELPER_BOTS)} ON (`/helper`)\n"
                             f"🏦 *House Balance:* ₹{HOUSE_BALANCE:,.2f}"
                         )
                         admin_keyboard = {
@@ -4494,6 +4689,16 @@ def telegram_webhook():
                 post_match_actions.pop(token, None)
                 factor = 2.0 if is_double else 1.0
                 execute_post_match_restart(chat_id, message_id, user_id, payload, factor, callback_query_id)
+                return jsonify({'status': 'ok'}), 200
+
+            if callback_data.startswith("hlp_"):
+                if user_id not in admin_list:
+                    answer_callback(callback_query_id, NOT_YOUR_MESSAGE_TEXT)
+                    return jsonify({'status': 'ok'}), 200
+                note = handle_helper_button(callback_data)
+                h_text, h_kb = build_helper_panel()
+                edit_message(chat_id, message_id, h_text, reply_markup=h_kb)
+                answer_callback(callback_query_id, note)
                 return jsonify({'status': 'ok'}), 200
 
             answer_callback(callback_query_id)
@@ -5085,6 +5290,207 @@ def telegram_webhook():
     except Exception as e:
         print(f"❌ Webhook Error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 200
+
+
+# ===================== 🤖 /helper COMMAND + HELPER WEBHOOK =====================
+def _public_base_url():
+    env = os.environ.get("PUBLIC_URL")
+    if env:
+        return env.rstrip("/")
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    return f"https://{host}"
+
+def helper_set_hook(h, base_url):
+    """Button taps on helper messages (Bet Again / Bet Double) come back to this server."""
+    data = _helper_post(h, "setWebhook", {
+        "url": f"{base_url}/helper-webhook/{h['id']}",
+        "secret_token": helper_hook_secret(h["token"]),
+        "allowed_updates": ["callback_query"],
+        "drop_pending_updates": True,
+    }, timeout=10)
+    h["hook"] = bool(data and data.get("ok"))
+    return h["hook"]
+
+def build_helper_panel():
+    on_count = sum(1 for h in HELPER_BOTS if h.get("enabled"))
+    lines = [f"🤖 *Helper Bots* ({len(HELPER_BOTS)}/{MAX_HELPERS}) · {on_count} ON", ""]
+    if not HELPER_BOTS:
+        lines.append("No helper added yet. Main bot is throwing emojis itself.")
+    for i, h in enumerate(HELPER_BOTS, 1):
+        state = "🟢 ON" if h.get("enabled") else "🔴 OFF"
+        btn = "" if h.get("hook") else " · ⚠️ buttons not linked"
+        lines.append(f"{i}. @{_md_safe(h.get('username'))} — {state}{btn}")
+    lines += [
+        "",
+        "Helpers throw every emoji in groups and send the round / final round messages.",
+        "Main bot throws only in DMs, or as backup if no helper can.",
+        "",
+        "`/helper add <token>` — add (send in bot DM)",
+        "`/helper remove 1` · `/helper on 1` · `/helper off 1`",
+        "`/helper on all` · `/helper off all`",
+        "`/helper test` — send in the group to check helpers",
+    ]
+    rows = []
+    for i, h in enumerate(HELPER_BOTS, 1):
+        rows.append([
+            {"text": f"{i}. @{h.get('username')} {'🟢 ON' if h.get('enabled') else '🔴 OFF'}", "callback_data": f"hlp_tg_{h['id']}"},
+            {"text": "🗑 Remove", "callback_data": f"hlp_rm_{h['id']}"},
+        ])
+    return "\n".join(lines), ({"inline_keyboard": rows} if rows else None)
+
+def _find_helper(ref):
+    ref = str(ref or "").strip().lstrip("@").lower()
+    if ref.isdigit() and 1 <= int(ref) <= len(HELPER_BOTS):
+        return HELPER_BOTS[int(ref) - 1]
+    for h in HELPER_BOTS:
+        if str(h.get("username", "")).lower() == ref or str(h.get("id")) == ref:
+            return h
+    return None
+
+def _remove_helper(h):
+    _helper_post(h, "deleteWebhook", {"drop_pending_updates": True})
+    if h in HELPER_BOTS:
+        HELPER_BOTS.remove(h)
+    save_helpers()
+
+def handle_helper_button(data):
+    try:
+        hid = int(data.rsplit("_", 1)[1])
+    except Exception:
+        return "Expired."
+    h = next((x for x in HELPER_BOTS if x.get("id") == hid), None)
+    if not h:
+        return "Helper already removed."
+    if data.startswith("hlp_tg_"):
+        h["enabled"] = not h.get("enabled")
+        save_helpers()
+        return f"@{h.get('username')} is now {'ON' if h['enabled'] else 'OFF'}"
+    if data.startswith("hlp_rm_"):
+        _remove_helper(h)
+        return f"@{h.get('username')} removed"
+    return ""
+
+def handle_helper_command(chat_id, chat_type, text, message):
+    parts = text.split()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+
+    if sub == "add":
+        if chat_type != "private":
+            try:
+                requests.post(f"{TELEGRAM_API_URL}/deleteMessage", json={"chat_id": chat_id, "message_id": message.get("message_id")}, timeout=3)
+            except Exception:
+                pass
+            send_message(chat_id, "🔒 Never send a bot token in a group. Send `/helper add <token>` in my DM.\nIf others saw it, open @BotFather → /revoke for that bot and use the new token.")
+            return
+        token = arg.strip()
+        if not re.match(r"^\d{5,}:[A-Za-z0-9_-]{30,}$", token):
+            send_message(chat_id, "⚠️ Usage: `/helper add <bot token>`\nCreate a new bot in @BotFather (/newbot) and paste its token here.")
+            return
+        if TELEGRAM_BOT_TOKEN and token.split(":")[0] == str(TELEGRAM_BOT_TOKEN).split(":")[0]:
+            send_message(chat_id, "⚠️ That is the main bot's own token. Use a new bot from @BotFather.")
+            return
+        if any(h.get("token") == token or str(h.get("id")) == token.split(":")[0] for h in HELPER_BOTS):
+            send_message(chat_id, "⚠️ This helper is already added.")
+            return
+        if len(HELPER_BOTS) >= MAX_HELPERS:
+            send_message(chat_id, f"⚠️ Max {MAX_HELPERS} helpers. Remove one first with `/helper remove <number>`.")
+            return
+        try:
+            me = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=8).json()
+        except Exception:
+            me = None
+        if not me or not me.get("ok") or not (me.get("result") or {}).get("is_bot"):
+            send_message(chat_id, "❌ Token not working. Copy it again from @BotFather.")
+            return
+        r = me["result"]
+        h = {"id": r["id"], "username": r.get("username") or str(r["id"]), "token": token, "enabled": True, "hook": False}
+        hook_ok = helper_set_hook(h, _public_base_url())
+        HELPER_BOTS.append(h)
+        save_helpers()
+        n = len(HELPER_BOTS)
+        uname = _md_safe(h["username"])
+        msg = (
+            f"✅ *Helper {n} added:* @{uname} (🟢 ON)\n\n"
+            f"Next step: add @{uname} to your game group(s).\n"
+            "If members can't send stickers/GIFs in that group, make the helper an admin.\n"
+            "Then send `/helper test` in the group."
+        )
+        if not hook_ok:
+            msg += "\n\n⚠️ Could not link its buttons — final round messages with buttons will be sent by the main bot. Try `/helper add` again later."
+        send_message(chat_id, msg)
+        return
+
+    if sub in ("remove", "del", "delete", "rm"):
+        h = _find_helper(arg)
+        if not h:
+            send_message(chat_id, "⚠️ Usage: `/helper remove <number>` (see `/helper`)")
+            return
+        _remove_helper(h)
+        send_message(chat_id, f"🗑 Helper @{_md_safe(h.get('username'))} removed.")
+        return
+
+    if sub in ("on", "off"):
+        want = sub == "on"
+        targets = HELPER_BOTS if arg.lower() == "all" else [x for x in [_find_helper(arg)] if x]
+        if not targets:
+            send_message(chat_id, f"⚠️ Usage: `/helper {sub} <number>` or `/helper {sub} all`")
+            return
+        for h in targets:
+            h["enabled"] = want
+            if want:
+                _helper_cooldown.pop(h.get("id"), None)
+                for k in [k for k in _helper_chat_block if k[0] == h.get("id")]:
+                    _helper_chat_block.pop(k, None)
+        save_helpers()
+        names = ", ".join("@" + _md_safe(h.get("username")) for h in targets)
+        send_message(chat_id, f"{'🟢' if want else '🔴'} {names} {'ON' if want else 'OFF'}.")
+        return
+
+    if sub == "test":
+        if chat_type == "private":
+            send_message(chat_id, "ℹ️ Send `/helper test` inside the game group.")
+            return
+        report = []
+        for i, h in enumerate(HELPER_BOTS, 1):
+            uname = _md_safe(h.get("username"))
+            if not h.get("enabled"):
+                report.append(f"{i}. @{uname} — 🔴 OFF")
+                continue
+            _helper_chat_block.pop((h.get("id"), chat_id), None)
+            data = _helper_post(h, "sendMessage", {"chat_id": chat_id, "text": f"🤖 Helper {i} ready ✅"})
+            if data and data.get("ok"):
+                report.append(f"{i}. @{uname} — ✅ ready")
+            else:
+                why = (data or {}).get("description", "no reply")
+                report.append(f"{i}. @{uname} — ❌ {_md_safe(why)}")
+        if not report:
+            report.append("No helpers added. Use `/helper add <token>` in my DM.")
+        send_message(chat_id, "🧪 *Helper test*\n" + "\n".join(report))
+        return
+
+    p_text, p_kb = build_helper_panel()
+    send_message(chat_id, p_text, reply_markup=p_kb)
+
+@app.route('/helper-webhook/<int:helper_id>', methods=['POST'])
+def helper_webhook(helper_id):
+    """Button taps on messages a helper sent arrive here and are handled exactly
+    like main-bot taps, but the replies go out through that helper."""
+    h = next((x for x in HELPER_BOTS if x.get("id") == helper_id), None)
+    if not h:
+        return jsonify({'status': 'ok'}), 200
+    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not _hb_hmac.compare_digest(got, helper_hook_secret(h["token"])):
+        return "Unauthorized", 401
+    data = request.get_json(silent=True) or {}
+    if 'callback_query' not in data:
+        return jsonify({'status': 'ok'}), 200
+    prev = getattr(_tg_ctx, "api", None)
+    _tg_ctx.api = helper_api(h)
+    try:
+        return telegram_webhook()
+    finally:
+        _tg_ctx.api = prev
 
 @app.route('/zapupi-webhook', methods=['POST'])
 def zapupi_webhook():
