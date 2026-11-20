@@ -69,10 +69,11 @@ def schedule_pvb_turn_timeout(chat_id, user_id, game):
         rem_rolls = cur["rolls_per_round"] - len(cur["current_user_rolls"])
         if rem_rolls <= 0:
             return
+        gid_part = f" (`{gid}`)" if gid else ""
         warn_msg = (
-            f"⏳ *Inactivity Warning* (`{gid}`)\n\n"
-            f"Hey {player_tag}, please send {emoji} (`x{rem_rolls}`) within the next *60 seconds*, "
-            f"otherwise the bot will automatically roll on your behalf!"
+            f"⏳ *Turn Timeout Warning*{gid_part}\n\n"
+            f"⚠️ {player_tag}, please send {emoji} (`x{rem_rolls}`) within the next *60 seconds*, "
+            f"else the bot will roll for you!"
         )
         send_message(chat_id, warn_msg)
 
@@ -101,9 +102,10 @@ def schedule_pvb_turn_timeout(chat_id, user_id, game):
                     remove_inline_keyboard(s_chat_id, s_msg_id)
                     cur["start_message_id"] = None
 
+            gid_part = f" (`{gid}`)" if gid else ""
             send_message(
                 chat_id,
-                f"⌛ *Timeout!* {player_tag} didn't roll in time — *bot is throwing {emoji} for you now...*"
+                f"⏰ *Timeout*{gid_part} — {player_tag}, bot is throwing {emoji} (`x{rem_rolls}`) for you..."
             )
 
             auto_vals = roll_bot_series(chat_id, emoji, rem_rolls)
@@ -150,8 +152,8 @@ def schedule_pvp_turn_timeout(chat_id, match_id, pvm):
         player_tag = format_user_mention(target_uid)
         warn_msg = (
             f"⏳ *Turn Timeout Warning* (`{gid}`)\n\n"
-            f"⚠️ {player_tag}, please throw {emoji} (`x{rem_rolls}`) within the next *60 seconds*, "
-            f"or your match will be *forfeited* to your opponent!"
+            f"⚠️ {player_tag}, throw {emoji} (`x{rem_rolls}`) within the next *60 seconds*, "
+            f"else your game will forfeit!"
         )
         send_message(chat_id, warn_msg)
 
