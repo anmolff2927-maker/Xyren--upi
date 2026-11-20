@@ -5,6 +5,7 @@ import io
 import re
 import uuid
 import string
+import threading
 from datetime import datetime
 import requests
 from flask import Flask, request, jsonify
@@ -45,6 +46,180 @@ active_pvp_games = {}
 active_bj_games = {}
 post_match_actions = {}
 pending_manual_txns = {}
+turn_locks = {}
+
+def get_turn_lock(lock_key):
+    if lock_key not in turn_locks:
+        turn_locks[lock_key] = threading.Lock()
+    return turn_locks[lock_key]
+
+def schedule_pvb_turn_timeout(chat_id, user_id, game):
+    token = uuid.uuid4().hex
+    game["turn_token"] = token
+    emoji = game["emoji"]
+    gid = game.get("game_id")
+
+    def on_warn():
+        cur = active_games.get(user_id)
+        if not isinstance(cur, dict) or cur is not game or cur.get("turn_token") != token:
+            return
+        if cur.get("step") not in ["selecting_turn", "waiting_user_first", "waiting_user_second"]:
+            return
+        player_tag = format_user_mention(user_id)
+        rem_rolls = cur["rolls_per_round"] - len(cur["current_user_rolls"])
+        if rem_rolls <= 0:
+            return
+        warn_msg = (
+            f"⏳ *Inactivity Warning* (`{gid}`)\n\n"
+            f"Hey {player_tag}, please send {emoji} (`x{rem_rolls}`) within the next *60 seconds*, "
+            f"otherwise the bot will automatically roll on your behalf!"
+        )
+        send_message(chat_id, warn_msg)
+
+    def on_timeout():
+        lock = get_turn_lock(f"pvb_{user_id}")
+        with lock:
+            cur = active_games.get(user_id)
+            if not isinstance(cur, dict) or cur is not game or cur.get("turn_token") != token:
+                return
+            if cur.get("step") not in ["selecting_turn", "waiting_user_first", "waiting_user_second"]:
+                return
+
+            cur["turn_token"] = None
+            player_tag = format_user_mention(user_id)
+            rolls_needed = cur["rolls_per_round"]
+            rem_rolls = rolls_needed - len(cur["current_user_rolls"])
+            if rem_rolls <= 0:
+                return
+
+            if cur["step"] == "selecting_turn":
+                cur["first_turn"] = "user"
+                cur["step"] = "waiting_user_first"
+                s_chat_id = cur.get("start_chat_id") or chat_id
+                s_msg_id = cur.get("start_message_id")
+                if s_msg_id:
+                    remove_inline_keyboard(s_chat_id, s_msg_id)
+                    cur["start_message_id"] = None
+
+            send_message(
+                chat_id,
+                f"⌛ *Timeout!* {player_tag} didn't roll in time — *bot is throwing {emoji} for you now...*"
+            )
+
+            auto_vals = roll_bot_series(chat_id, emoji, rem_rolls)
+            cur["current_user_rolls"].extend(auto_vals)
+
+            step = cur["step"]
+            if step == "waiting_user_first":
+                u_expr = "+".join(map(str, cur["current_user_rolls"]))
+                send_message(
+                    chat_id,
+                    f"👤 {player_tag} Auto-Rolls ({emoji}): `{u_expr}` (*{sum(cur['current_user_rolls'])}*)\n\n🤖 Now bot is throwing..."
+                )
+                time.sleep(0.8)
+                b_vals = roll_bot_series(chat_id, emoji, rolls_needed)
+                cur["current_bot_rolls"] = b_vals
+                resolve_round_and_match(chat_id, user_id, cur)
+            elif step == "waiting_user_second":
+                resolve_round_and_match(chat_id, user_id, cur)
+
+    t_warn = threading.Timer(60.0, on_warn)
+    t_warn.daemon = True
+    t_warn.start()
+
+    t_expire = threading.Timer(120.0, on_timeout)
+    t_expire.daemon = True
+    t_expire.start()
+
+def schedule_pvp_turn_timeout(chat_id, match_id, pvm):
+    token = uuid.uuid4().hex
+    pvm["turn_token"] = token
+    target_uid = pvm["turn"]
+    emoji = pvm["emoji"]
+    gid = pvm.get("game_id") or match_id
+
+    def on_warn():
+        cur = active_pvp_games.get(match_id)
+        if cur is not pvm or cur.get("turn_token") != token or cur.get("turn") != target_uid:
+            return
+        is_p1 = (target_uid == cur["p1_id"])
+        cur_rolls = cur["p1_rolls"] if is_p1 else cur["p2_rolls"]
+        rem_rolls = cur["rolls_per_round"] - len(cur_rolls)
+        if rem_rolls <= 0:
+            return
+        player_tag = format_user_mention(target_uid)
+        warn_msg = (
+            f"⏳ *Turn Timeout Warning* (`{gid}`)\n\n"
+            f"⚠️ {player_tag}, please throw {emoji} (`x{rem_rolls}`) within the next *60 seconds*, "
+            f"or your match will be *forfeited* to your opponent!"
+        )
+        send_message(chat_id, warn_msg)
+
+    def on_forfeit():
+        global HOUSE_BALANCE
+        lock = get_turn_lock(f"pvp_{match_id}")
+        with lock:
+            cur = active_pvp_games.get(match_id)
+            if cur is not pvm or cur.get("turn_token") != token or cur.get("turn") != target_uid:
+                return
+
+            cur["turn_token"] = None
+            p1 = cur["p1_id"]
+            p2 = cur["p2_id"]
+            loser_id = target_uid
+            winner_id = p2 if loser_id == p1 else p1
+            bet = cur["bet"]
+            g_name = GAME_NAME_MAP.get(emoji, "Game")
+            mode = cur["mode"]
+            rw_label = cur["rw_label"]
+
+            mult = float(GAME_MULTIPLIERS.get("pvp", 1.94))
+            payout = bet * mult
+            house_fee = max(0.0, (bet * 2) - payout)
+            HOUSE_BALANCE += house_fee
+
+            win_pnl = payout - bet
+            user_balances[winner_id] = user_balances.get(winner_id, 0.0) + payout
+            persist_user(winner_id)
+            persist_user(loser_id)
+            save_config_value("house_balance", HOUSE_BALANCE)
+            update_user_stats(winner_id, emoji, bet, win_pnl, True)
+            update_user_stats(loser_id, emoji, bet, -bet, False)
+
+            label = f"PvP {g_name} ({rw_label}/{mode})"
+            record_user_bet(winner_id, label, bet, win_pnl, "WON (Forfeit)", game_id=gid)
+            record_user_bet(loser_id, label, bet, -bet, "FORFEITED", game_id=gid)
+            win_actor = format_win_actor(winner_id)
+            mark_game_finished(
+                gid,
+                "forfeited",
+                extra_meta={"winner_id": winner_id, "winner_label": win_actor, "forfeited_by": loser_id, "payout": payout}
+            )
+            log_win_to_channel(winner_id, emoji, f"PvP {g_name}", payout, fmt_mult(mult))
+
+            loser_tag = format_user_mention(loser_id)
+            winner_tag = format_user_mention(winner_id)
+            forfeit_text = (
+                f"⌛ *Match Forfeited!* (`{gid}` | {emoji} | `{rw_label}`)\n\n"
+                f"🚫 {loser_tag} failed to throw within 2 minutes and forfeited the match.\n"
+                f"🏆 *Winner:* {winner_tag}\n"
+                f"🎁 *Payout:* *{format_money(payout, winner_id)}* (`{fmt_mult(mult)}`)"
+            )
+            send_message(chat_id, forfeit_text)
+
+            active_pvp_games.pop(match_id, None)
+            if active_games.get(p1) == match_id:
+                active_games.pop(p1, None)
+            if active_games.get(p2) == match_id:
+                active_games.pop(p2, None)
+
+    t_warn = threading.Timer(60.0, on_warn)
+    t_warn.daemon = True
+    t_warn.start()
+
+    t_forfeit = threading.Timer(120.0, on_forfeit)
+    t_forfeit.daemon = True
+    t_forfeit.start()
 
 def normalize_chat_id(raw_id):
     if raw_id is None:
@@ -817,6 +992,7 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         "start_message_id": sent_msg_id,
         "trigger_msg_id": trigger_msg_id
     }
+    schedule_pvb_turn_timeout(chat_id, user_id, active_games[user_id])
 
 def resolve_pvp_round_and_match(chat_id, match_id, pvm):
     global HOUSE_BALANCE
@@ -914,6 +1090,7 @@ def resolve_pvp_round_and_match(chat_id, match_id, pvm):
         chat_id,
         f"➡️ *Round {pvm['round_num']}* — Player 1 (`{p1}`), send `{emoji}` x{pvm['rolls_per_round']} in chat!"
     )
+    schedule_pvp_turn_timeout(chat_id, match_id, pvm)
 
 DECK_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 DECK_SUITS = ["♠", "♥", "♦", "♣"]
@@ -1863,9 +2040,11 @@ def resolve_round_and_match(chat_id, user_id, game):
         game["current_bot_rolls"] = b_next
         b_next_expr = "+".join(map(str, b_next))
         send_message(chat_id, f"🤖 Bot Roll: `{b_next_expr}` (*{sum(b_next)}*)\n\n👉 *Now your turn! Send `{emoji}` x{rolls_per_round} in chat.*")
+        schedule_pvb_turn_timeout(chat_id, user_id, game)
     else:
         game["step"] = "waiting_user_first"
         send_message(chat_id, f"👤 *Round {game['round_num']}* — Your turn! Send `{emoji}` x{rolls_per_round} in chat.")
+        schedule_pvb_turn_timeout(chat_id, user_id, game)
 
 @app.route('/')
 def index():
@@ -2125,69 +2304,78 @@ def telegram_webhook():
                 user_dice = message['dice']
 
                 if isinstance(active_ref, str) and active_ref in active_pvp_games:
-                    pvm = active_pvp_games[active_ref]
-                    if pvm["chat_id"] != chat_id or pvm["turn"] != user_id:
+                    with get_turn_lock(f"pvp_{active_ref}"):
+                        pvm = active_pvp_games.get(active_ref)
+                        if not pvm or pvm["chat_id"] != chat_id or pvm["turn"] != user_id:
+                            return jsonify({'status': 'ok'}), 200
+                        if user_dice.get('emoji') != pvm["emoji"]:
+                            return jsonify({'status': 'ok'}), 200
+
+                        pvm["turn_token"] = None
+                        val = user_dice.get('value', 1)
+                        needed = pvm["rolls_per_round"]
+                        is_p1 = (user_id == pvm["p1_id"])
+                        roll_list = pvm["p1_rolls"] if is_p1 else pvm["p2_rolls"]
+                        roll_list.append(val)
+
+                        rem = needed - len(roll_list)
+                        if rem > 0:
+                            send_message(chat_id, f"🎲 Player `{user_id}` Roll `{len(roll_list)}/{needed}`: *{val}* — Send `{rem}` more `{pvm['emoji']}`!")
+                            schedule_pvp_turn_timeout(chat_id, active_ref, pvm)
+                            return jsonify({'status': 'ok'}), 200
+
+                        if is_p1:
+                            expr = "+".join(map(str, roll_list))
+                            send_message(chat_id, f"👤 P1 (`{pvm['p1_id']}`) Rolls: `{expr}` (*{sum(roll_list)}*)\n\n👉 *Player 2 (`{pvm['p2_id']}`), your turn! Send `{pvm['emoji']}` x{needed}.*")
+                            pvm["turn"] = pvm["p2_id"]
+                            schedule_pvp_turn_timeout(chat_id, active_ref, pvm)
+                        else:
+                            resolve_pvp_round_and_match(chat_id, active_ref, pvm)
                         return jsonify({'status': 'ok'}), 200
-                    if user_dice.get('emoji') != pvm["emoji"]:
+
+                with get_turn_lock(f"pvb_{user_id}"):
+                    game = active_games.get(user_id)
+                    if not isinstance(game, dict):
                         return jsonify({'status': 'ok'}), 200
-
-                    val = user_dice.get('value', 1)
-                    needed = pvm["rolls_per_round"]
-                    is_p1 = (user_id == pvm["p1_id"])
-                    roll_list = pvm["p1_rolls"] if is_p1 else pvm["p2_rolls"]
-                    roll_list.append(val)
-
-                    rem = needed - len(roll_list)
-                    if rem > 0:
-                        send_message(chat_id, f"🎲 Player `{user_id}` Roll `{len(roll_list)}/{needed}`: *{val}* — Send `{rem}` more `{pvm['emoji']}`!")
-                        return jsonify({'status': 'ok'}), 200
-
-                    if is_p1:
-                        expr = "+".join(map(str, roll_list))
-                        send_message(chat_id, f"👤 P1 (`{pvm['p1_id']}`) Rolls: `{expr}` (*{sum(roll_list)}*)\n\n👉 *Player 2 (`{pvm['p2_id']}`), your turn! Send `{pvm['emoji']}` x{needed}.*")
-                        pvm["turn"] = pvm["p2_id"]
-                    else:
-                        resolve_pvp_round_and_match(chat_id, active_ref, pvm)
-                    return jsonify({'status': 'ok'}), 200
-
-                game = active_ref
-                expected_emoji = game['emoji']
-                
-                if user_dice.get('emoji') == expected_emoji and game['step'] in ['selecting_turn', 'waiting_user_first', 'waiting_user_second']:
-                    if game['step'] == 'selecting_turn':
-                        game['first_turn'] = 'user'
-                        game['step'] = 'waiting_user_first'
-                        s_chat_id = game.get('start_chat_id') or chat_id
-                        s_msg_id = game.get('start_message_id')
-                        if s_msg_id:
-                            remove_inline_keyboard(s_chat_id, s_msg_id)
-                            game['start_message_id'] = None
-                    user_val = user_dice.get('value', 1)
-                    rolls_needed = game['rolls_per_round']
-                    game['current_user_rolls'].append(user_val)
+                    expected_emoji = game['emoji']
                     
-                    remaining = rolls_needed - len(game['current_user_rolls'])
-                    if remaining > 0:
-                        send_message(chat_id, f"🎲 Roll `{len(game['current_user_rolls'])}/{rolls_needed}`: *{user_val}* — Send `{remaining}` more `{expected_emoji}`!")
-                        return jsonify({'status': 'ok'}), 200
+                    if user_dice.get('emoji') == expected_emoji and game['step'] in ['selecting_turn', 'waiting_user_first', 'waiting_user_second']:
+                        game["turn_token"] = None
+                        if game['step'] == 'selecting_turn':
+                            game['first_turn'] = 'user'
+                            game['step'] = 'waiting_user_first'
+                            s_chat_id = game.get('start_chat_id') or chat_id
+                            s_msg_id = game.get('start_message_id')
+                            if s_msg_id:
+                                remove_inline_keyboard(s_chat_id, s_msg_id)
+                                game['start_message_id'] = None
+                        user_val = user_dice.get('value', 1)
+                        rolls_needed = game['rolls_per_round']
+                        game['current_user_rolls'].append(user_val)
                         
-                    step = game['step']
-                    if step == 'waiting_user_first':
-                        u_expr = "+".join(map(str, game['current_user_rolls']))
-                        player_tag = format_user_mention(user_id)
-                        user_roll_msg_id = message.get('message_id')
-                        send_message(chat_id, f"👤 {player_tag} Rolls ({expected_emoji}): `{u_expr}` (*{sum(game['current_user_rolls'])}*)\n\n🤖 Now bot is throwing...")
-                        time.sleep(0.8)
-                        
-                        b_vals = roll_bot_series(chat_id, expected_emoji, rolls_needed, reply_to_message_id=user_roll_msg_id)
-                        game['current_bot_rolls'] = b_vals
-                        
-                        resolve_round_and_match(chat_id, user_id, game)
-                        return jsonify({'status': 'ok'}), 200
-                        
-                    elif step == 'waiting_user_second':
-                        resolve_round_and_match(chat_id, user_id, game)
-                        return jsonify({'status': 'ok'}), 200
+                        remaining = rolls_needed - len(game['current_user_rolls'])
+                        if remaining > 0:
+                            send_message(chat_id, f"🎲 Roll `{len(game['current_user_rolls'])}/{rolls_needed}`: *{user_val}* — Send `{remaining}` more `{expected_emoji}`!")
+                            schedule_pvb_turn_timeout(chat_id, user_id, game)
+                            return jsonify({'status': 'ok'}), 200
+                            
+                        step = game['step']
+                        if step == 'waiting_user_first':
+                            u_expr = "+".join(map(str, game['current_user_rolls']))
+                            player_tag = format_user_mention(user_id)
+                            user_roll_msg_id = message.get('message_id')
+                            send_message(chat_id, f"👤 {player_tag} Rolls ({expected_emoji}): `{u_expr}` (*{sum(game['current_user_rolls'])}*)\n\n🤖 Now bot is throwing...")
+                            time.sleep(0.8)
+                            
+                            b_vals = roll_bot_series(chat_id, expected_emoji, rolls_needed, reply_to_message_id=user_roll_msg_id)
+                            game['current_bot_rolls'] = b_vals
+                            
+                            resolve_round_and_match(chat_id, user_id, game)
+                            return jsonify({'status': 'ok'}), 200
+                            
+                        elif step == 'waiting_user_second':
+                            resolve_round_and_match(chat_id, user_id, game)
+                            return jsonify({'status': 'ok'}), 200
 
             if 'text' in message:
                 text = message['text'].strip()
@@ -3284,6 +3472,7 @@ def telegram_webhook():
                     f"👉 *Round 1 — Player 1 (`{host_id}`), send `{ch['emoji']}` x{ch['rolls_per_round']} in chat!*"
                 )
                 edit_message(target_chat, target_msg, start_text)
+                schedule_pvp_turn_timeout(target_chat, match_id, active_pvp_games[match_id])
                 return jsonify({'status': 'ok'}), 200
 
             if callback_data.startswith("bj_"):
@@ -3515,30 +3704,33 @@ def telegram_webhook():
                 
             elif callback_data == "play_bot_first":
                 remove_inline_keyboard(chat_id, message_id)
-                if user_id not in active_games or isinstance(active_games[user_id], str):
-                    send_message(chat_id, "⚠️ Session expired. Start a new game.")
-                    return jsonify({'status': 'ok'}), 200
+                with get_turn_lock(f"pvb_{user_id}"):
+                    if user_id not in active_games or isinstance(active_games[user_id], str):
+                        send_message(chat_id, "⚠️ Session expired. Start a new game.")
+                        return jsonify({'status': 'ok'}), 200
+                        
+                    game = active_games[user_id]
+                    if game.get("step") != "selecting_turn":
+                        return jsonify({'status': 'ok'}), 200
+                    game["turn_token"] = None
+                    game["start_message_id"] = None
+                    emoji = game["emoji"]
+                    rolls_needed = game["rolls_per_round"]
+                    game["current_user_rolls"] = []
+                    game["current_bot_rolls"] = []
                     
-                game = active_games[user_id]
-                if game.get("step") != "selecting_turn":
-                    return jsonify({'status': 'ok'}), 200
-                game["start_message_id"] = None
-                emoji = game["emoji"]
-                rolls_needed = game["rolls_per_round"]
-                game["current_user_rolls"] = []
-                game["current_bot_rolls"] = []
-                
-                game["first_turn"] = "bot"
-                game["step"] = "waiting_user_second"
-                player_tag = format_user_mention(user_id)
-                trig_id = game.get("trigger_msg_id")
-                send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first for {player_tag}...", reply_to_message_id=trig_id)
-                
-                b_vals = roll_bot_series(chat_id, emoji, rolls_needed, reply_to_message_id=trig_id)
-                game["current_bot_rolls"] = b_vals
-                b_expr = "+".join(map(str, b_vals))
-                
-                send_message(chat_id, f"🤖 Bot Rolls: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now your turn! Please send `{emoji}` x{rolls_needed} in chat.*")
+                    game["first_turn"] = "bot"
+                    game["step"] = "waiting_user_second"
+                    player_tag = format_user_mention(user_id)
+                    trig_id = game.get("trigger_msg_id")
+                    send_message(chat_id, f"🤖 Bot is throwing `{emoji}` x{rolls_needed} first for {player_tag}...", reply_to_message_id=trig_id)
+                    
+                    b_vals = roll_bot_series(chat_id, emoji, rolls_needed, reply_to_message_id=trig_id)
+                    game["current_bot_rolls"] = b_vals
+                    b_expr = "+".join(map(str, b_vals))
+                    
+                    send_message(chat_id, f"🤖 Bot Rolls: `{b_expr}` (*{sum(b_vals)}*)\n\n👉 *Now your turn! Please send `{emoji}` x{rolls_needed} in chat.*")
+                    schedule_pvb_turn_timeout(chat_id, user_id, game)
                 
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
