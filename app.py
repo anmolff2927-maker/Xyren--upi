@@ -46,6 +46,8 @@ open_pvp_challenges = {}
 active_pvp_games = {}
 active_bj_games = {}
 post_match_actions = {}
+button_owners = {}  # (chat_id, message_id) -> user_id who owns that message's buttons
+NOT_YOUR_MESSAGE_TEXT = "This is not your message ❌"
 pending_manual_txns = {}
 turn_locks = {}
 
@@ -1201,6 +1203,7 @@ def start_versus_match(chat_id, message_id, user_id, emoji, bet_inr, mode, rw_la
         res = send_message(chat_id, text, reply_markup=keyboard)
         if res and res.get("ok"):
             sent_msg_id = res["result"]["message_id"]
+    remember_button_owner(chat_id, sent_msg_id, user_id)
 
     active_games[user_id] = {
         "game_id": gid,
@@ -1647,6 +1650,34 @@ def build_dr_result_message(gid, dice_val, arg, is_win, win_amt=0.0, multiplier=
         f"━━━━━━━━━━━━━━━━"
     )
 
+def remember_button_owner(chat_id, sent_or_msg_id, user_id):
+    """Remember which player owns the buttons on a message (accepts a send_message result or a message id)."""
+    msg_id = sent_or_msg_id
+    if isinstance(sent_or_msg_id, dict):
+        msg_id = sent_or_msg_id.get("result", {}).get("message_id") if sent_or_msg_id.get("ok") else None
+    if chat_id is None or not msg_id or user_id is None:
+        return
+    button_owners[(chat_id, msg_id)] = user_id
+    if len(button_owners) > 5000:
+        for k in list(button_owners.keys())[:1000]:
+            button_owners.pop(k, None)
+
+def find_button_owner(chat_id, message_id):
+    """Who owns the buttons on this message? None if unknown."""
+    owner = button_owners.get((chat_id, message_id))
+    if owner is not None:
+        return owner
+    for uid, st in list(pending_game_setup.items()):
+        if st and st.get("message_id") == message_id and st.get("chat_id") in (chat_id, None):
+            return uid
+    for uid, g in list(active_games.items()):
+        if isinstance(g, dict) and g.get("start_message_id") == message_id and g.get("start_chat_id") in (chat_id, None):
+            return uid
+    for uid, bj in list(active_bj_games.items()):
+        if bj and bj.get("message_id") == message_id and bj.get("chat_id") in (chat_id, None):
+            return uid
+    return None
+
 def create_post_match_keyboard(user_id, payload):
     token = uuid.uuid4().hex[:10]
     post_match_actions[token] = payload
@@ -1731,6 +1762,7 @@ def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier
         )
         sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
         msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+        remember_button_owner(chat_id, msg_id, user_id)
         active_bj_games[user_id] = {
             "game_id": gid,
             "chat_id": chat_id,
@@ -2692,7 +2724,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/offgame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     DM_GAMES_ENABLED = False
                     save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
@@ -2701,7 +2733,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/ongame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     DM_GAMES_ENABLED = True
                     save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
@@ -2710,7 +2742,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/setgc(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split(maxsplit=1)
                     if len(parts) < 2 or not parts[1].strip():
@@ -2730,7 +2762,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/setrate(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2749,7 +2781,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/sethb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2773,7 +2805,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/deducthb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2799,7 +2831,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/minbet(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2817,7 +2849,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/maxbet(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2835,7 +2867,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/addbalance(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 3:
@@ -2866,7 +2898,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/deductbalance(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 3:
@@ -2916,7 +2948,7 @@ def telegram_webhook():
 
                 if matched_mult_key:
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2950,7 +2982,7 @@ def telegram_webhook():
 
                 if matched_7up_key:
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -2969,7 +3001,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/setmultidrnum(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 3:
@@ -2988,7 +3020,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/mults(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     dr_nums_str = ", ".join(f"{k}n: {fmt_mult(v)}" for k, v in GAME_MULTIPLIERS["dr_nums"].items())
                     m7 = GAME_MULTIPLIERS.get("7up", {})
@@ -3019,12 +3051,12 @@ def telegram_webhook():
                         else:
                             send_message(chat_id, "⚠️ Invalid format. Use: `/approve <chat_id>`")
                     else:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                     return jsonify({'status': 'ok'}), 200
 
                 if re.match(rf"^/info(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized. `/info` is restricted to admins.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -3039,7 +3071,7 @@ def telegram_webhook():
 
                 if re.match(rf"^/search(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
-                        send_message(chat_id, "⛔ Unauthorized. `/search` is restricted to admins.")
+                        pass  # normal users get no reply to admin commands
                         return jsonify({'status': 'ok'}), 200
                     parts = text.split()
                     if len(parts) < 2:
@@ -3247,6 +3279,7 @@ def telegram_webhook():
                         )
                         sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
                         msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+                        remember_button_owner(chat_id, msg_id, user_id)
 
                         active_bj_games[user_id] = {
                             "game_id": gid,
@@ -3294,7 +3327,8 @@ def telegram_webhook():
                             ]
                         ]
                     }
-                    send_message(chat_id, f"🌐 *Select Your Preferred Currency:*\nCurrent: *{user_currency.get(user_id, 'INR')}*", reply_markup=keyboard)
+                    cur_sent = send_message(chat_id, f"🌐 *Select Your Preferred Currency:*\nCurrent: *{user_currency.get(user_id, 'INR')}*", reply_markup=keyboard)
+                    remember_button_owner(chat_id, cur_sent, user_id)
                     
                 elif text == '/stats':
                     send_message(chat_id, "📊 Generating your stats card...")
@@ -3364,7 +3398,7 @@ def telegram_webhook():
                         }
                         send_message(chat_id, panel_text, reply_markup=admin_keyboard)
                     else:
-                        send_message(chat_id, "⛔ Unauthorized.")
+                        pass  # normal users get no reply to admin commands
                         
                 elif text.startswith('/dr '):
                     active_summary = get_active_game_summary(user_id)
@@ -3522,6 +3556,7 @@ def telegram_webhook():
                                     reply_to_message_id=message.get('message_id') if chat_type in ['group', 'supergroup'] else None
                                 )
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+                                remember_button_owner(chat_id, msg_id, user_id)
                                 pending_game_setup[user_id] = {
                                     "game_id": gid,
                                     "chat_id": chat_id,
@@ -3541,6 +3576,7 @@ def telegram_webhook():
                                 )
                                 sent = send_message(chat_id, setup_msg, reply_markup=game_style_keyboard())
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+                                remember_button_owner(chat_id, msg_id, user_id)
                                 pending_game_setup[user_id] = {
                                     "game_id": gid,
                                     "chat_id": chat_id,
@@ -3559,6 +3595,7 @@ def telegram_webhook():
                                 )
                                 sent = send_message(chat_id, rw_msg, reply_markup=rw_mode_keyboard())
                                 msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+                                remember_button_owner(chat_id, msg_id, user_id)
                                 pending_game_setup[user_id] = {
                                     "game_id": gid,
                                     "chat_id": chat_id,
@@ -3588,7 +3625,7 @@ def telegram_webhook():
                     remove_inline_keyboard(chat_id, message_id)
                     return jsonify({'status': 'ok'}), 200
                 if user_id != entry.get("initiator_id"):
-                    answer_callback(callback_query_id, "Only the user who initiated this transaction can confirm or cancel!")
+                    answer_callback(callback_query_id, NOT_YOUR_MESSAGE_TEXT)
                     return jsonify({'status': 'ok'}), 200
                 pending_manual_txns.pop(token, None)
                 remove_inline_keyboard(chat_id, message_id)
@@ -3599,6 +3636,14 @@ def telegram_webhook():
                     edit_message(chat_id, message_id, "❌ *Transaction Cancelled.*")
                     answer_callback(callback_query_id, "Transaction cancelled.")
                 return jsonify({'status': 'ok'}), 200
+
+            # Another player tapped someone else's buttons: warn them, change nothing.
+            shared_buttons = ("pvp_acc_", "pvp_can_", "adm_", "admin_wd_", "infopg_", "pm_again_", "pm_double_", "myhistpg_")
+            if not callback_data.startswith(shared_buttons):
+                btn_owner = find_button_owner(chat_id, message_id)
+                if btn_owner is not None and btn_owner != user_id:
+                    answer_callback(callback_query_id, NOT_YOUR_MESSAGE_TEXT)
+                    return jsonify({'status': 'ok'}), 200
 
             if chat_type == 'private' and not DM_GAMES_ENABLED and (callback_data.startswith("pm_again_") or callback_data.startswith("pm_double_")):
                 answer_callback(callback_query_id, "❌ Games in DM are currently turned off.")
@@ -3615,7 +3660,7 @@ def telegram_webhook():
                     remove_inline_keyboard(chat_id, message_id)
                     return jsonify({'status': 'ok'}), 200
                 if user_id != payload.get("owner_id"):
-                    answer_callback(callback_query_id, "Only the player who played this match can use these buttons!")
+                    answer_callback(callback_query_id, NOT_YOUR_MESSAGE_TEXT)
                     return jsonify({'status': 'ok'}), 200
                 active_summary = get_active_game_summary(user_id)
                 if active_summary:
@@ -3635,7 +3680,7 @@ def telegram_webhook():
 
             if callback_data.startswith("infopg_"):
                 if user_id not in admin_list:
-                    send_message(chat_id, "⛔ Unauthorized.")
+                    pass  # normal users get no reply to admin commands
                     return jsonify({'status': 'ok'}), 200
                 try:
                     _, raw_uid, section, raw_page = callback_data.split("_", 3)
@@ -3653,7 +3698,7 @@ def telegram_webhook():
                     target_uid = int(raw_uid)
                     page = int(raw_page)
                     if user_id != target_uid and user_id not in admin_list:
-                        answer_callback(callback_query_id, "This history belongs to another player.")
+                        answer_callback(callback_query_id, NOT_YOUR_MESSAGE_TEXT)
                         return jsonify({'status': 'ok'}), 200
                     hist_text, hist_kb = build_user_history_page(target_uid, page=page)
                     edit_message(chat_id, message_id, hist_text, reply_markup=hist_kb)
@@ -3855,7 +3900,7 @@ def telegram_webhook():
                     edit_message(chat_id, message_id, "⚠️ Challenge already closed or expired.")
                     return jsonify({'status': 'ok'}), 200
                 if user_id != ch["host_id"] and user_id not in admin_list:
-                    answer_callback(callback_query_id, "Only challenger can cancel!")
+                    answer_callback(callback_query_id, NOT_YOUR_MESSAGE_TEXT)
                     return jsonify({'status': 'ok'}), 200
                 if ch.get("game_id"):
                     mark_game_finished(ch["game_id"], "cancelled")
@@ -4039,7 +4084,7 @@ def telegram_webhook():
                 
             elif callback_data.startswith("adm_"):
                 if user_id not in admin_list:
-                    send_message(chat_id, "⛔ Unauthorized.")
+                    pass  # normal users get no reply to admin commands
                     return jsonify({'status': 'ok'}), 200
                     
                 if callback_data == "adm_add_bal":
@@ -4175,7 +4220,7 @@ def telegram_webhook():
                         }
                         send_message(chat_id, f"✍️ *Please enter the rejection reason for user `{target_user}` in chat:*")
                 else:
-                    send_message(chat_id, "⛔ Unauthorized.")
+                    pass  # normal users get no reply to admin commands
                 
             elif callback_data == "play_bot_first":
                 remove_inline_keyboard(chat_id, message_id)
