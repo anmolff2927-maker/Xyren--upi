@@ -44,6 +44,118 @@ open_pvp_challenges = {}
 active_pvp_games = {}
 active_bj_games = {}
 post_match_actions = {}
+pending_manual_txns = {}
+
+def normalize_chat_id(raw_id):
+    if raw_id is None:
+        return None
+    s = str(raw_id).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return raw_id
+
+def is_group_approved(raw_chat_id):
+    norm = normalize_chat_id(raw_chat_id)
+    if norm in approved_groups:
+        return True
+    if str(norm) in {str(x) for x in approved_groups}:
+        return True
+    return False
+
+def create_manual_txn_confirmation(initiator_id, prompt_chat_id, action_type, payload):
+    token = uuid.uuid4().hex[:10]
+    pending_manual_txns[token] = {
+        "initiator_id": initiator_id,
+        "prompt_chat_id": prompt_chat_id,
+        "action_type": action_type,
+        "payload": payload,
+        "created_at": time.time(),
+    }
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Confirm", "callback_data": f"mtx_ok_{token}"},
+                {"text": "❌ Cancel", "callback_data": f"mtx_no_{token}"},
+            ]
+        ]
+    }
+    return token, keyboard
+
+def execute_manual_txn(entry):
+    global HOUSE_BALANCE
+    action_type = entry["action_type"]
+    initiator_id = entry["initiator_id"]
+    prompt_chat_id = entry["prompt_chat_id"]
+    p = entry["payload"]
+
+    if action_type == "sethb":
+        val = float(p["val"])
+        HOUSE_BALANCE = val
+        save_config_value("house_balance", HOUSE_BALANCE)
+        send_message(prompt_chat_id, f"✅ House Balance set to *{format_money(HOUSE_BALANCE, initiator_id)}*.")
+
+    elif action_type == "deducthb":
+        amt = float(p["amt"])
+        HOUSE_BALANCE = max(0.0, HOUSE_BALANCE - amt)
+        save_config_value("house_balance", HOUSE_BALANCE)
+        send_message(
+            prompt_chat_id,
+            f"✅ Deducted *{format_money(amt, initiator_id)}* from House Balance.\n🏦 New House Balance: *{format_money(HOUSE_BALANCE, initiator_id)}*"
+        )
+
+    elif action_type == "addbalance":
+        target_uid = int(p["target_uid"])
+        amt_inr = float(p["amt_inr"])
+        if target_uid not in user_balances:
+            user_balances[target_uid] = 0.0
+            user_currency[target_uid] = 'INR'
+        user_balances[target_uid] += amt_inr
+        persist_user(target_uid)
+        send_message(
+            prompt_chat_id,
+            f"✅ Added *{format_money(amt_inr, target_uid)}* to `{target_uid}`.\n💰 New Balance: *{format_money(user_balances[target_uid], target_uid)}*"
+        )
+        send_message(target_uid, f"💰 *Admin credited your account!* +{format_money(amt_inr, target_uid)}")
+
+    elif action_type == "deductbalance":
+        target_uid = int(p["target_uid"])
+        amt_inr = float(p["amt_inr"])
+        cur_b = float(user_balances.get(target_uid, 0.0))
+        user_balances[target_uid] = max(0.0, cur_b - amt_inr)
+        persist_user(target_uid)
+        send_message(
+            prompt_chat_id,
+            f"✅ Deducted *{format_money(amt_inr, target_uid)}* from `{target_uid}`.\n💰 New Balance: *{format_money(user_balances[target_uid], target_uid)}*"
+        )
+        send_message(target_uid, f"⚠️ *Admin deducted from your account.* -{format_money(amt_inr, target_uid)}")
+
+    elif action_type == "tip":
+        receiver_id = int(p["receiver_id"])
+        amt_inr = float(p["amt_inr"])
+        origin_chat_id = p.get("origin_chat_id", prompt_chat_id)
+        current_bal = float(user_balances.get(initiator_id, 0.0))
+        if current_bal < amt_inr:
+            send_message(
+                prompt_chat_id,
+                f"❌ *Insufficient Balance!*\n💰 Your Balance: *{format_money(current_bal, initiator_id)}*\n🎯 Required Tip: *{format_money(amt_inr, initiator_id)}*"
+            )
+            return
+        if receiver_id not in user_balances:
+            user_balances[receiver_id] = 0.0
+            user_currency[receiver_id] = 'INR'
+        user_balances[initiator_id] = current_bal - amt_inr
+        user_balances[receiver_id] = float(user_balances.get(receiver_id, 0.0)) + amt_inr
+        persist_user(initiator_id)
+        persist_user(receiver_id)
+
+        sender_label = display_sender_label(initiator_id)
+        amt_for_receiver = format_money(amt_inr, receiver_id)
+        amt_for_sender = format_money(amt_inr, initiator_id)
+        send_message(receiver_id, f"{amt_for_receiver} tip recived from {sender_label}")
+        if origin_chat_id != receiver_id:
+            send_message(origin_chat_id, f"✅ Sent *{amt_for_sender}* tip to {display_sender_label(receiver_id)}!")
+        if prompt_chat_id != origin_chat_id:
+            send_message(prompt_chat_id, f"✅ Tip confirmed: *{amt_for_sender}* sent to {display_sender_label(receiver_id)}.")
 game_id_registry = {}
 deposit_states = {}
 withdrawal_states = {}
@@ -304,6 +416,9 @@ def persist_withdrawal(user_id, amount, upi, ts):
         conn.close()
 
 def persist_approved_group(chat_id):
+    norm_id = normalize_chat_id(chat_id)
+    if norm_id is None:
+        return
     conn = get_db_connection()
     if not conn:
         return
@@ -312,7 +427,7 @@ def persist_approved_group(chat_id):
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO approved_groups (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
-                    (chat_id,)
+                    (int(norm_id),)
                 )
     except Exception as e:
         print(f"DB persist_approved_group error: {e}")
@@ -427,7 +542,8 @@ def load_all_from_db():
 
             cur.execute("SELECT chat_id FROM approved_groups")
             for r in cur.fetchall():
-                approved_groups.add(int(r["chat_id"]))
+                if r and r.get("chat_id") is not None:
+                    approved_groups.add(int(r["chat_id"]))
 
             cur.execute("SELECT game_id, record_json FROM game_records")
             for r in cur.fetchall():
@@ -1772,7 +1888,7 @@ def telegram_webhook():
             if 'reply_to_message' in message and message['reply_to_message'].get('from'):
                 register_user_identity(message['reply_to_message']['from'])
             
-            if chat_type in ['group', 'supergroup'] and chat_id not in approved_groups and user_id not in admin_list:
+            if chat_type in ['group', 'supergroup'] and not is_group_approved(chat_id) and user_id not in admin_list:
                 if 'text' in message and message['text'].startswith('/myid'):
                     send_message(chat_id, f"📌 This Group Chat ID is: `{chat_id}`")
                 return jsonify({'status': 'ok'}), 200
@@ -2107,9 +2223,14 @@ def telegram_webhook():
                         val = float(parts[1])
                         if val < 0:
                             raise ValueError()
-                        HOUSE_BALANCE = val
-                        save_config_value("house_balance", HOUSE_BALANCE)
-                        send_message(chat_id, f"✅ House Balance set to *{format_money(HOUSE_BALANCE, user_id)}*.")
+                        _, kb = create_manual_txn_confirmation(user_id, chat_id, "sethb", {"val": val})
+                        conf_txt = (
+                            "⚠️ *Confirm Manual Transaction*\n\n"
+                            "• *Action:* Set House Balance (`/sethb`)\n"
+                            f"• *Current HB:* *{format_money(HOUSE_BALANCE, user_id)}*\n"
+                            f"• *New HB:* *{format_money(val, user_id)}*"
+                        )
+                        send_message(chat_id, conf_txt, reply_markup=kb)
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid non-negative amount (e.g. `/sethb 150000`).")
                     return jsonify({'status': 'ok'}), 200
@@ -2126,9 +2247,16 @@ def telegram_webhook():
                         amt = float(parts[1])
                         if amt <= 0:
                             raise ValueError()
-                        HOUSE_BALANCE = max(0.0, HOUSE_BALANCE - amt)
-                        save_config_value("house_balance", HOUSE_BALANCE)
-                        send_message(chat_id, f"✅ Deducted *{format_money(amt, user_id)}* from House Balance.\n🏦 New House Balance: *{format_money(HOUSE_BALANCE, user_id)}*")
+                        new_hb = max(0.0, HOUSE_BALANCE - amt)
+                        _, kb = create_manual_txn_confirmation(user_id, chat_id, "deducthb", {"amt": amt})
+                        conf_txt = (
+                            "⚠️ *Confirm Manual Transaction*\n\n"
+                            "• *Action:* Deduct House Balance (`/deducthb`)\n"
+                            f"• *Deduct Amount:* *{format_money(amt, user_id)}*\n"
+                            f"• *Current HB:* *{format_money(HOUSE_BALANCE, user_id)}*\n"
+                            f"• *HB After:* *{format_money(new_hb, user_id)}*"
+                        )
+                        send_message(chat_id, conf_txt, reply_markup=kb)
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid positive amount (e.g. `/deducthb 5000`).")
                     return jsonify({'status': 'ok'}), 200
@@ -2185,12 +2313,19 @@ def telegram_webhook():
                     if amt_inr is None or amt_inr <= 0:
                         send_message(chat_id, "⚠️ Enter a valid positive amount.")
                         return jsonify({'status': 'ok'}), 200
-                    if target_uid not in user_balances:
-                        user_balances[target_uid] = 0.0
-                        user_currency[target_uid] = 'INR'
-                    user_balances[target_uid] += amt_inr
-                    send_message(chat_id, f"✅ Added *{format_money(amt_inr, target_uid)}* to `{target_uid}`.\n💰 New Balance: *{format_money(user_balances[target_uid], target_uid)}*")
-                    send_message(target_uid, f"💰 *Admin credited your account!* +{format_money(amt_inr, target_uid)}")
+                    cur_b = float(user_balances.get(target_uid, 0.0))
+                    _, kb = create_manual_txn_confirmation(
+                        user_id, chat_id, "addbalance", {"target_uid": target_uid, "amt_inr": amt_inr}
+                    )
+                    conf_txt = (
+                        "⚠️ *Confirm Manual Transaction*\n\n"
+                        "• *Action:* Add Balance (`/addbalance`)\n"
+                        f"• *Target User:* `{target_uid}` ({display_sender_label(target_uid)})\n"
+                        f"• *Amount:* *+{format_money(amt_inr, target_uid)}*\n"
+                        f"• *Current Balance:* *{format_money(cur_b, target_uid)}*\n"
+                        f"• *Balance After:* *{format_money(cur_b + amt_inr, target_uid)}*"
+                    )
+                    send_message(chat_id, conf_txt, reply_markup=kb)
                     return jsonify({'status': 'ok'}), 200
 
                 if re.match(rf"^/deductbalance(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
@@ -2209,10 +2344,20 @@ def telegram_webhook():
                     if amt_inr is None or amt_inr <= 0:
                         send_message(chat_id, "⚠️ Enter a valid positive amount.")
                         return jsonify({'status': 'ok'}), 200
-                    cur_b = user_balances.get(target_uid, 0.0)
-                    user_balances[target_uid] = max(0.0, cur_b - amt_inr)
-                    send_message(chat_id, f"✅ Deducted *{format_money(amt_inr, target_uid)}* from `{target_uid}`.\n💰 New Balance: *{format_money(user_balances[target_uid], target_uid)}*")
-                    send_message(target_uid, f"⚠️ *Admin deducted from your account.* -{format_money(amt_inr, target_uid)}")
+                    cur_b = float(user_balances.get(target_uid, 0.0))
+                    after_b = max(0.0, cur_b - amt_inr)
+                    _, kb = create_manual_txn_confirmation(
+                        user_id, chat_id, "deductbalance", {"target_uid": target_uid, "amt_inr": amt_inr}
+                    )
+                    conf_txt = (
+                        "⚠️ *Confirm Manual Transaction*\n\n"
+                        "• *Action:* Deduct Balance (`/deductbalance`)\n"
+                        f"• *Target User:* `{target_uid}` ({display_sender_label(target_uid)})\n"
+                        f"• *Deduct Amount:* *-{format_money(amt_inr, target_uid)}*\n"
+                        f"• *Current Balance:* *{format_money(cur_b, target_uid)}*\n"
+                        f"• *Balance After:* *{format_money(after_b, target_uid)}*"
+                    )
+                    send_message(chat_id, conf_txt, reply_markup=kb)
                     return jsonify({'status': 'ok'}), 200
 
                 mult_cmd_map = {
@@ -2392,20 +2537,20 @@ def telegram_webhook():
                         )
                         return jsonify({'status': 'ok'}), 200
 
-                    if receiver_id not in user_balances:
-                        user_balances[receiver_id] = 0.0
-                        user_currency[receiver_id] = 'INR'
-
-                    user_balances[user_id] = current_bal - amt_inr
-                    user_balances[receiver_id] = user_balances.get(receiver_id, 0.0) + amt_inr
-
-                    sender_label = display_sender_label(user_id)
-                    amt_for_receiver = format_money(amt_inr, receiver_id)
-                    amt_for_sender = format_money(amt_inr, user_id)
-
-                    send_message(receiver_id, f"{amt_for_receiver} tip recived from {sender_label}")
-                    if chat_id != receiver_id:
-                        send_message(chat_id, f"✅ Sent *{amt_for_sender}* tip to {display_sender_label(receiver_id)}!")
+                    _, kb = create_manual_txn_confirmation(
+                        user_id,
+                        chat_id,
+                        "tip",
+                        {"receiver_id": receiver_id, "amt_inr": amt_inr, "origin_chat_id": chat_id},
+                    )
+                    conf_txt = (
+                        "⚠️ *Confirm Tip Transaction*\n\n"
+                        "• *Action:* Send Tip (`/tip`)\n"
+                        f"• *To:* {display_sender_label(receiver_id)} (`{receiver_id}`)\n"
+                        f"• *Amount:* *{format_money(amt_inr, user_id)}*\n"
+                        f"• *Your Balance:* *{format_money(current_bal, user_id)}*"
+                    )
+                    send_message(chat_id, conf_txt, reply_markup=kb)
                     return jsonify({'status': 'ok'}), 200
 
                 if text == '/start':
@@ -2804,6 +2949,27 @@ def telegram_webhook():
             message_id = query['message']['message_id']
             user_id = query['from']['id']
             
+            if callback_data.startswith("mtx_ok_") or callback_data.startswith("mtx_no_"):
+                is_confirm = callback_data.startswith("mtx_ok_")
+                token = callback_data.replace("mtx_ok_", "", 1) if is_confirm else callback_data.replace("mtx_no_", "", 1)
+                entry = pending_manual_txns.get(token)
+                if not entry:
+                    answer_callback(callback_query_id, "Transaction already processed or expired.")
+                    remove_inline_keyboard(chat_id, message_id)
+                    return jsonify({'status': 'ok'}), 200
+                if user_id != entry.get("initiator_id"):
+                    answer_callback(callback_query_id, "Only the user who initiated this transaction can confirm or cancel!")
+                    return jsonify({'status': 'ok'}), 200
+                pending_manual_txns.pop(token, None)
+                remove_inline_keyboard(chat_id, message_id)
+                if is_confirm:
+                    execute_manual_txn(entry)
+                    answer_callback(callback_query_id, "Transaction confirmed!")
+                else:
+                    edit_message(chat_id, message_id, "❌ *Transaction Cancelled.*")
+                    answer_callback(callback_query_id, "Transaction cancelled.")
+                return jsonify({'status': 'ok'}), 200
+
             if callback_data.startswith("pm_again_") or callback_data.startswith("pm_double_"):
                 is_double = callback_data.startswith("pm_double_")
                 token = callback_data.replace("pm_double_", "", 1) if is_double else callback_data.replace("pm_again_", "", 1)
