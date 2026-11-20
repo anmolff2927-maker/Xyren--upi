@@ -43,6 +43,7 @@ pending_game_setup = {}
 open_pvp_challenges = {}
 active_pvp_games = {}
 active_bj_games = {}
+post_match_actions = {}
 game_id_registry = {}
 deposit_states = {}
 withdrawal_states = {}
@@ -958,10 +959,11 @@ def generate_stats_image(user_id):
 
 def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
     if user_id not in user_stats:
-        user_stats[user_id] = {"games": 0, "wins": 0, "losses": 0, "total_pnl": 0.0, "biggest_win": 0.0, "game_counts": {}}
+        user_stats[user_id] = {"games": 0, "wins": 0, "losses": 0, "total_pnl": 0.0, "total_wager": 0.0, "biggest_win": 0.0, "game_counts": {}}
     
     st = user_stats[user_id]
     st["games"] += 1
+    st["total_wager"] = float(st.get("total_wager", 0.0)) + float(bet_inr)
     st["total_pnl"] += profit_inr
     
     if game_name not in st["game_counts"]:
@@ -976,6 +978,250 @@ def update_user_stats(user_id, game_name, bet_inr, profit_inr, is_win):
         st["losses"] += 1
     persist_user(user_id)
 
+
+def get_user_total_wager(uid):
+    st = user_stats.get(uid) or {}
+    if "total_wager" in st and st["total_wager"] is not None:
+        return float(st["total_wager"])
+    # Fallback to bet logs if total_wager not yet populated on older records
+    logs = user_bet_logs.get(uid) or []
+    if logs:
+        return sum(float(item.get("bet", 0.0)) for item in logs)
+    return 0.0
+
+def generate_top_wagerers_image(viewer_id=None):
+    ranked = []
+    candidate_ids = set(user_stats.keys()) | set(user_bet_logs.keys()) | set(user_balances.keys())
+    for uid in candidate_ids:
+        wager_inr = get_user_total_wager(uid)
+        if wager_inr > 0:
+            st = user_stats.get(uid) or {}
+            games = int(st.get("games", len(user_bet_logs.get(uid) or [])))
+            wins = int(st.get("wins", 0))
+            win_rate = (wins / games * 100.0) if games > 0 else 0.0
+            uname = user_usernames.get(uid)
+            fname = user_first_names.get(uid)
+            label = f"@{uname}" if uname else (fname[:16] if fname else f"User {uid}")
+            ranked.append({
+                "uid": uid,
+                "label": label,
+                "wager_inr": wager_inr,
+                "games": games,
+                "win_rate": win_rate
+            })
+
+    ranked.sort(key=lambda x: x["wager_inr"], reverse=True)
+    top10 = ranked[:10]
+
+    width, height = 740, 620
+    img = Image.new("RGB", (width, height), color=(14, 17, 29))
+    d = ImageDraw.Draw(img)
+
+    # Header banner
+    d.rectangle([0, 0, width, 84], fill=(28, 34, 58))
+    d.rectangle([0, 82, width, 86], fill=(255, 198, 41))
+    d.text((28, 18), "🏆 TOP 10 WAGERERS LEADERBOARD", fill=(255, 215, 64))
+    d.text((28, 48), f"{BOT_USERNAME}  •  Total Volume (All Time)", fill=(185, 198, 230))
+
+    # Column headers
+    y_hdr = 100
+    d.text((28, y_hdr), "RANK", fill=(140, 155, 190))
+    d.text((115, y_hdr), "PLAYER", fill=(140, 155, 190))
+    d.text((380, y_hdr), "WAGERED", fill=(140, 155, 190))
+    d.text((565, y_hdr), "GAMES / WR", fill=(140, 155, 190))
+    d.line([(24, 122), (width - 24, 122)], fill=(45, 55, 85), width=1)
+
+    if not top10:
+        d.text((28, 160), "No wagers recorded yet. Play a game to claim #1!", fill=(200, 210, 235))
+    else:
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        row_h = 46
+        start_y = 132
+        for idx, row in enumerate(top10, start=1):
+            ry = start_y + (idx - 1) * row_h
+            bg_col = (22, 28, 46) if idx % 2 == 1 else (17, 21, 36)
+            if idx == 1:
+                bg_col = (44, 36, 16)
+            d.rounded_rectangle([22, ry, width - 22, ry + row_h - 4], radius=8, fill=bg_col)
+
+            rank_txt = f"#{idx}"
+            if idx in medals:
+                rank_txt = f"#{idx}"
+            rank_col = (255, 215, 64) if idx == 1 else ((210, 218, 235) if idx <= 3 else (155, 170, 200))
+            name_col = (255, 225, 105) if idx == 1 else (238, 242, 250)
+            wager_col = (72, 245, 155) if idx <= 3 else (110, 215, 255)
+
+            # Display wager in viewer's currency if set, otherwise INR
+            curr = user_currency.get(viewer_id, "INR") if viewer_id else "INR"
+            if curr == "USDT" and EXCHANGE_RATE > 0:
+                w_disp = f"${row['wager_inr'] / EXCHANGE_RATE:,.2f}"
+            else:
+                w_disp = f"₹{row['wager_inr']:,.2f}"
+
+            d.text((28, ry + 13), rank_txt, fill=rank_col)
+            d.text((115, ry + 13), str(row["label"])[:20], fill=name_col)
+            d.text((380, ry + 13), w_disp, fill=wager_col)
+            d.text((565, ry + 13), f"{row['games']}g • {row['win_rate']:.0f}%", fill=(175, 188, 215))
+
+    d.text((28, height - 28), "Public Leaderboard  •  Updated live from player wagers", fill=(120, 132, 160))
+
+    bio = io.BytesIO()
+    img.save(bio, "PNG")
+    bio.seek(0)
+    return bio
+
+def create_post_match_keyboard(user_id, payload):
+    token = uuid.uuid4().hex[:10]
+    post_match_actions[token] = payload
+    last_bet = float(payload.get("bet", 0.0))
+    double_bet = last_bet * 2.0
+
+    again_label = f"🔁 Play Again ({format_money(last_bet, user_id)})"
+    row1 = [{"text": again_label, "callback_data": f"pm_again_{token}"}]
+
+    if double_bet <= MAX_BET:
+        double_label = f"⚡ Bet Double ({format_money(double_bet, user_id)})"
+        row1.append({"text": double_label, "callback_data": f"pm_double_{token}"})
+
+    return {"inline_keyboard": [row1]}
+
+def execute_post_match_restart(chat_id, message_id, user_id, payload, multiplier_factor, callback_query_id):
+    kind = payload.get("kind")
+    last_bet = float(payload.get("bet", 0.0))
+    next_bet = last_bet * multiplier_factor
+
+    if next_bet <= 0:
+        answer_callback(callback_query_id, "Invalid bet amount.")
+        return
+
+    if next_bet < MIN_BET or next_bet > MAX_BET:
+        answer_callback(
+            callback_query_id,
+            f"Bet limit check failed! Allowed: {format_money(MIN_BET, user_id)} - {format_money(MAX_BET, user_id)}"
+        )
+        return
+
+    # Prevent starting overlapping active games
+    if kind == "versus" and user_id in active_games:
+        answer_callback(callback_query_id, "Finish your current active game first!")
+        return
+    if kind == "bj" and user_id in active_bj_games:
+        answer_callback(callback_query_id, "Finish your active Blackjack hand first!")
+        return
+
+    fresh_bal = float(user_balances.get(user_id, 0.0))
+    if fresh_bal < next_bet:
+        answer_callback(
+            callback_query_id,
+            f"Insufficient balance! Need {format_money(next_bet, user_id)}, have {format_money(fresh_bal, user_id)}"
+        )
+        return
+
+    # Remove buttons from the old result message so it cannot be re-used
+    remove_inline_keyboard(chat_id, message_id)
+
+    if kind == "versus":
+        gid = generate_game_id()
+        start_versus_match(
+            chat_id,
+            None,
+            user_id,
+            payload["emoji"],
+            next_bet,
+            payload.get("mode") or "normal",
+            payload.get("rw_label") or "1r1w",
+            game_id=gid
+        )
+        answer_callback(callback_query_id, f"Started {format_money(next_bet, user_id)} match!")
+
+    elif kind == "bj":
+        global HOUSE_BALANCE
+        gid = generate_game_id()
+        user_balances[user_id] = fresh_bal - next_bet
+        persist_user(user_id)
+        register_game_record(gid, "blackjack", user_id, next_bet, meta={"chat_id": chat_id}, refund_on_cancel=True)
+        p_cards = [draw_card(), draw_card()]
+        d_cards = [draw_card(), draw_card()]
+        p_tot = calculate_hand_total(p_cards)
+        can_double = float(user_balances.get(user_id, 0.0)) >= next_bet
+        table_msg = (
+            f"🃏 *Blackjack Started!* (`{gid}`)\n\n"
+            f"👤 Your Hand: {format_cards(p_cards)} (*{p_tot}*)\n"
+            f"🤖 Dealer Shows: `{d_cards[0]}` `[?]`\n"
+            f"💰 Bet: {format_money(next_bet, user_id)}\n\n"
+            f"Choose your move:"
+        )
+        sent = send_message(chat_id, table_msg, reply_markup=bj_action_keyboard(can_double=can_double))
+        msg_id = sent.get("result", {}).get("message_id") if sent and sent.get("ok") else None
+        active_bj_games[user_id] = {
+            "game_id": gid,
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "bet": next_bet,
+            "player_cards": p_cards,
+            "dealer_cards": d_cards,
+            "doubled": False
+        }
+        answer_callback(callback_query_id, f"Blackjack started ({format_money(next_bet, user_id)})!")
+
+    elif kind == "dr":
+        arg = payload.get("dr_arg")
+        gid = generate_game_id()
+        user_balances[user_id] = fresh_bal - next_bet
+        persist_user(user_id)
+        register_game_record(gid, "prediction", user_id, next_bet, meta={"choice": arg}, refund_on_cancel=True)
+
+        is_win = False
+        multiplier = 0.0
+        win_desc = ""
+        if arg in ["high", "low", "odd", "even"]:
+            send_message(chat_id, f"🎲 Rolling dice for Prediction (`{gid}` | *{arg.upper()}* | Bet: {format_money(next_bet, user_id)})...")
+            res = send_animated_game(chat_id, "🎲")
+            dice_val = res["result"]["dice"]["value"] if res and "result" in res else random.randint(1, 6)
+            time.sleep(1)
+            if arg == "high" and dice_val in [4, 5, 6]: is_win = True
+            elif arg == "low" and dice_val in [1, 2, 3]: is_win = True
+            elif arg == "odd" and dice_val in [1, 3, 5]: is_win = True
+            elif arg == "even" and dice_val in [2, 4, 6]: is_win = True
+            multiplier = float(GAME_MULTIPLIERS.get("dr", 1.92))
+            win_desc = f"Prediction: {arg.upper()}"
+        else:
+            nums = [int(n.strip()) for n in str(arg).split(",")]
+            send_message(chat_id, f"🎲 Rolling dice for Numbers (`{gid}` | *{nums}* | Bet: {format_money(next_bet, user_id)})...")
+            res = send_animated_game(chat_id, "🎲")
+            dice_val = res["result"]["dice"]["value"] if res and "result" in res else random.randint(1, 6)
+            time.sleep(1)
+            if dice_val in nums: is_win = True
+            dr_num_map = GAME_MULTIPLIERS.get("dr_nums", {1: 5.56, 2: 2.88, 3: 1.92, 4: 1.44, 5: 1.15})
+            multiplier = float(dr_num_map.get(len(nums), 1.0))
+            win_desc = f"Numbers: {nums}"
+
+        result_text = f"📊 *Dice Prediction Result* (`{gid}`)\n\n🎲 Rolled Number: *{dice_val}*\n🎯 {win_desc}\n\n"
+        if is_win:
+            win_amt = next_bet * multiplier
+            profit_inr = win_amt - next_bet
+            user_balances[user_id] = float(user_balances.get(user_id, 0.0)) + win_amt
+            HOUSE_BALANCE -= profit_inr
+            persist_user(user_id)
+            save_config_value("house_balance", HOUSE_BALANCE)
+            update_user_stats(user_id, "prediction", next_bet, profit_inr, True)
+            record_user_bet(user_id, f"Prediction ({win_desc})", next_bet, profit_inr, "WON", game_id=gid)
+            mark_game_finished(gid, "completed", extra_meta={"outcome": "WON", "pnl": profit_inr})
+            log_win_to_channel(user_id, "🔮", "Predict", win_amt, fmt_mult(multiplier))
+            result_text += f"🎉 *Congratulations! You WON {format_money(win_amt, user_id)}* (`{fmt_mult(multiplier)}`)! 🥳\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+        else:
+            profit_inr = -next_bet
+            HOUSE_BALANCE += next_bet
+            persist_user(user_id)
+            save_config_value("house_balance", HOUSE_BALANCE)
+            update_user_stats(user_id, "prediction", next_bet, profit_inr, False)
+            record_user_bet(user_id, f"Prediction ({win_desc})", next_bet, profit_inr, "LOST", game_id=gid)
+            mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
+            result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
+
+        pm_payload = {"kind": "dr", "owner_id": user_id, "bet": next_bet, "dr_arg": arg}
+        send_message(chat_id, result_text, reply_markup=create_post_match_keyboard(user_id, pm_payload))
+        answer_callback(callback_query_id, f"Predicted {arg} ({format_money(next_bet, user_id)})!")
 
 def format_history_money(amount_in_inr, user_id):
     curr = user_currency.get(user_id, 'INR')
@@ -1303,7 +1549,8 @@ def finish_bj_game(chat_id, message_id, user_id, bj, outcome):
         body = f"😢 *You Lost!* {reason_txt}\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
 
     mark_game_finished(gid, "completed", extra_meta={"outcome": outcome})
-    edit_message(chat_id, message_id, header + body, reply_markup=None)
+    pm_bj_payload = {"kind": "bj", "owner_id": user_id, "bet": bet}
+    edit_message(chat_id, message_id, header + body, reply_markup=create_post_match_keyboard(user_id, pm_bj_payload))
     if user_id in active_bj_games:
         del active_bj_games[user_id]
 
@@ -1466,7 +1713,15 @@ def resolve_round_and_match(chat_id, user_id, game):
                 f"💫 *Well played, but the bot got the better of you this time!* Better luck next round."
             )
 
-        send_message(chat_id, final_text)
+        pm_vs_payload = {
+            "kind": "versus",
+            "owner_id": user_id,
+            "bet": bet,
+            "emoji": emoji,
+            "mode": mode,
+            "rw_label": rw_label
+        }
+        send_message(chat_id, final_text, reply_markup=create_post_match_keyboard(user_id, pm_vs_payload))
         if user_id in active_games:
             del active_games[user_id]
         return
@@ -2036,12 +2291,13 @@ def telegram_webhook():
                     send_message(chat_id, txt)
                     return jsonify({'status': 'ok'}), 200
                 
-                if text.startswith('/approve '):
+                if re.match(r'^/approve(?:@\S+)?(?:\s+|$)', text, re.IGNORECASE):
                     if user_id in admin_list:
                         parts = text.split(' ')
                         if len(parts) > 1 and parts[1].strip('-').isdigit():
                             target_chat_id = int(parts[1])
                             approved_groups.add(target_chat_id)
+                            persist_approved_group(target_chat_id)
                             send_message(chat_id, f"✅ Group `{target_chat_id}` has been successfully *APPROVED*!")
                         else:
                             send_message(chat_id, "⚠️ Invalid format. Use: `/approve <chat_id>`")
@@ -2175,6 +2431,11 @@ def telegram_webhook():
                         "- `/dr 50 high` or `/dr 50 2,4,6`"
                     )
                     send_message(chat_id, help_text)
+
+                elif re.match(rf"^/top(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
+                    bio = generate_top_wagerers_image(viewer_id=user_id)
+                    send_photo(chat_id, bio, caption="🏆 *Top 10 Wagerers Leaderboard*")
+                    return jsonify({'status': 'ok'}), 200
 
                 elif re.match(rf"^/hb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?$", text, re.IGNORECASE):
                     send_message(chat_id, f"🏦 *House Balance:* *{format_money(HOUSE_BALANCE, user_id)}*")
@@ -2423,7 +2684,8 @@ def telegram_webhook():
                             mark_game_finished(gid, "completed", extra_meta={"outcome": "LOST", "pnl": profit_inr})
                             result_text += f"😢 *You Lost!* Better luck next time.\n💰 Balance: {format_money(user_balances[user_id], user_id)}"
                             
-                        send_message(chat_id, result_text)
+                        pm_dr_payload = {"kind": "dr", "owner_id": user_id, "bet": bet_inr, "dr_arg": arg}
+                        send_message(chat_id, result_text, reply_markup=create_post_match_keyboard(user_id, pm_dr_payload))
                     else:
                         send_message(chat_id, "⚠️ Format error! Use: `/dr <amount> <choice>`\nExample: `/dr 50 high` or `/dr 50 1,3,5`")
                         
@@ -2542,6 +2804,23 @@ def telegram_webhook():
             message_id = query['message']['message_id']
             user_id = query['from']['id']
             
+            if callback_data.startswith("pm_again_") or callback_data.startswith("pm_double_"):
+                is_double = callback_data.startswith("pm_double_")
+                token = callback_data.replace("pm_double_", "", 1) if is_double else callback_data.replace("pm_again_", "", 1)
+                payload = post_match_actions.get(token)
+                if not payload:
+                    answer_callback(callback_query_id, "This action has already been used or expired.")
+                    remove_inline_keyboard(chat_id, message_id)
+                    return jsonify({'status': 'ok'}), 200
+                if user_id != payload.get("owner_id"):
+                    answer_callback(callback_query_id, "Only the player who played this match can use these buttons!")
+                    return jsonify({'status': 'ok'}), 200
+                # Pop token before executing so double-clicks cannot spawn duplicate games
+                post_match_actions.pop(token, None)
+                factor = 2.0 if is_double else 1.0
+                execute_post_match_restart(chat_id, message_id, user_id, payload, factor, callback_query_id)
+                return jsonify({'status': 'ok'}), 200
+
             answer_callback(callback_query_id)
             
             if not callback_data.startswith("adm_") and not callback_data.startswith("bj_") and not callback_data.startswith("gs_") and not callback_data.startswith("rw_") and not callback_data.startswith("mc_") and not callback_data.startswith("pvp_") and not callback_data.startswith("infopg_") and not callback_data.startswith("myhistpg_"):
