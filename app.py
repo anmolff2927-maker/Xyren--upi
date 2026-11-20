@@ -2612,6 +2612,40 @@ def telegram_webhook():
                         send_message(chat_id, "⚠️ Enter a valid positive rate (e.g. `/setrate 98`).")
                     return jsonify({'status': 'ok'}), 200
 
+                if re.match(rf"^/offgame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    DM_GAMES_ENABLED = False
+                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+                    send_message(chat_id, "🔴 DM Games turned *OFF* (Only Emoji & BJ allowed in DM; other games in group).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/ongame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    DM_GAMES_ENABLED = True
+                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+                    send_message(chat_id, "🟢 DM Games turned *ON*.")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/setgc(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, f"🔗 Current Group Link: {GROUP_LINK}\nUsage: /setgc @grouplink")
+                        return jsonify({'status': 'ok'}), 200
+                    raw_gc = parts[1].strip()
+                    if not raw_gc.startswith("@") and not raw_gc.startswith("http"):
+                        raw_gc = f"@{raw_gc}"
+                    GROUP_LINK = raw_gc
+                    save_config_value("group_link", GROUP_LINK)
+                    send_message(chat_id, f"✅ Group link set to {GROUP_LINK}.")
+                    return jsonify({'status': 'ok'}), 200
+
                 if re.match(rf"^/sethb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
                     if user_id not in admin_list:
                         send_message(chat_id, "⛔ Unauthorized.")
