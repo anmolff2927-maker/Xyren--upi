@@ -372,6 +372,8 @@ EXCHANGE_RATE = 98.0
 MAINTENANCE_MODE = False
 DEPOSIT_ENABLED = True
 WITHDRAW_ENABLED = True
+DM_GAMES_ENABLED = True
+GROUP_LINK = "@grouplink"
 
 PAGE_SIZE = 5
 
@@ -688,6 +690,8 @@ def persist_config_all():
     save_config_value("deposit_enabled", DEPOSIT_ENABLED)
     save_config_value("withdraw_enabled", WITHDRAW_ENABLED)
     save_config_value("game_multipliers", GAME_MULTIPLIERS)
+    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+    save_config_value("group_link", GROUP_LINK)
 
 def persist_user(uid):
     if uid is None:
@@ -819,7 +823,7 @@ def persist_game_record(game_id, record):
         conn.close()
 
 def load_all_from_db():
-    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED
+    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED, DM_GAMES_ENABLED, GROUP_LINK
     conn = get_db_connection()
     if not conn:
         return
@@ -843,6 +847,10 @@ def load_all_from_db():
                     DEPOSIT_ENABLED = bool(v)
                 elif k == "withdraw_enabled":
                     WITHDRAW_ENABLED = bool(v)
+                elif k == "dm_games_enabled":
+                    DM_GAMES_ENABLED = bool(v)
+                elif k == "group_link":
+                    GROUP_LINK = str(v) if v else "@grouplink"
                 elif k == "game_multipliers" and isinstance(v, dict):
                     for mk, mv in v.items():
                         if mk == "dr_nums" and isinstance(mv, dict):
@@ -2265,7 +2273,7 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
-    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED
+    global HOUSE_BALANCE, MIN_BET, MAX_BET, EXCHANGE_RATE, MAINTENANCE_MODE, DEPOSIT_ENABLED, WITHDRAW_ENABLED, DM_GAMES_ENABLED, GROUP_LINK
     try:
         data = request.get_json()
         if not data:
@@ -2610,6 +2618,40 @@ def telegram_webhook():
                         send_message(chat_id, f"✅ Exchange rate updated to *₹{EXCHANGE_RATE:.2f} / USDT*.")
                     except ValueError:
                         send_message(chat_id, "⚠️ Enter a valid positive rate (e.g. `/setrate 98`).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/offgame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    DM_GAMES_ENABLED = False
+                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+                    send_message(chat_id, "🔴 DM Games turned *OFF* (Only Emoji & BJ allowed in DM; other games in group).")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/ongame(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    DM_GAMES_ENABLED = True
+                    save_config_value("dm_games_enabled", DM_GAMES_ENABLED)
+                    send_message(chat_id, "🟢 DM Games turned *ON*.")
+                    return jsonify({'status': 'ok'}), 200
+
+                if re.match(rf"^/setgc(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if user_id not in admin_list:
+                        send_message(chat_id, "⛔ Unauthorized.")
+                        return jsonify({'status': 'ok'}), 200
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, f"🔗 Current Group Link: `{GROUP_LINK}`\nUsage: `/setgc @grouplink`")
+                        return jsonify({'status': 'ok'}), 200
+                    raw_gc = parts[1].strip()
+                    if not raw_gc.startswith("@") and not raw_gc.startswith("http"):
+                        raw_gc = f"@{raw_gc}"
+                    GROUP_LINK = raw_gc
+                    save_config_value("group_link", GROUP_LINK)
+                    send_message(chat_id, f"✅ Group link set to `{GROUP_LINK}`.")
                     return jsonify({'status': 'ok'}), 200
 
                 if re.match(rf"^/sethb(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
@@ -3030,6 +3072,9 @@ def telegram_webhook():
                     return jsonify({'status': 'ok'}), 200
 
                 elif re.match(rf"^/7up(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if is_dm_game_blocked(chat_type, user_id, "7up"):
+                        send_dm_games_off_notice(chat_id)
+                        return jsonify({'status': 'ok'}), 200
                     active_summary = get_active_game_summary(user_id)
                     if active_summary:
                         send_message(chat_id, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
@@ -3073,6 +3118,9 @@ def telegram_webhook():
                     return jsonify({'status': 'ok'}), 200
 
                 elif re.match(rf"^/bj(?:@{re.escape(BOT_USERNAME.lstrip('@'))})?(?:\s|$)", text, re.IGNORECASE):
+                    if is_dm_game_blocked(chat_type, user_id, "bj"):
+                        send_dm_games_off_notice(chat_id)
+                        return jsonify({'status': 'ok'}), 200
                     active_summary = get_active_game_summary(user_id)
                     if active_summary:
                         send_message(chat_id, f"⚠️ You already have an active game (*{active_summary}*)! Finish it before starting a new game.")
@@ -3228,6 +3276,9 @@ def telegram_webhook():
                         send_message(chat_id, "⛔ Unauthorized.")
                         
                 elif text.startswith('/dr '):
+                    if is_dm_game_blocked(chat_type, user_id, "dr"):
+                        send_dm_games_off_notice(chat_id)
+                        return jsonify({'status': 'ok'}), 200
                     active_summary = get_active_game_summary(user_id)
                     if active_summary:
                         send_message(chat_id, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
@@ -3337,6 +3388,9 @@ def telegram_webhook():
                             break
                     
                     if triggered_game:
+                        if is_dm_game_blocked(chat_type, user_id, "emoji"):
+                            send_dm_games_off_notice(chat_id)
+                            return jsonify({'status': 'ok'}), 200
                         active_summary = get_active_game_summary(user_id)
                         if active_summary:
                             send_message(chat_id, f"⚠️ You are already playing *{active_summary}*! Finish it before starting another game.")
