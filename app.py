@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ZAPUPI_API_KEY = os.environ.get("ZAPUPI_API_KEY")
-BOT_USERNAME = "@Xyren_upibot"
+BOT_USERNAME = "@PaisaPlayz_bot"
 WINS_CHANNEL_ID = os.environ.get("WINS_CHANNEL_ID", "3555754688")
 WITHDRAW_LOG_CHANNEL_ID = os.environ.get("WITHDRAW_LOG_CHANNEL_ID", "3975966539")
 WINS_CHANNEL_USERNAME = "xyren_wins"
