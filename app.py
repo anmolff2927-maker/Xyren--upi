@@ -50,7 +50,7 @@ if _detected_username:
 else:
     print(f"⚠️ Could not verify bot username, using {BOT_USERNAME}. Set the BOT_USERNAME env variable to fix.")
 
-ADMIN_USER_ID = 6389122186
+ADMIN_USER_ID = 1822336097
 
 # ===================== ✨ PREMIUM (CUSTOM) EMOJIS =====================
 # Every Telegram message/button sent by this bot is passed through here: normal emojis
